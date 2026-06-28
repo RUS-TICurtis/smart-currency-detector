@@ -1,5 +1,10 @@
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import 'providers/camera_provider.dart';
+import '../speech/providers/speech_provider.dart';
 
 class CameraScreen extends HookConsumerWidget {
   const CameraScreen({super.key});
@@ -7,6 +12,7 @@ class CameraScreen extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
+    final cameraState = ref.watch(cameraControllerProvider);
 
     return Scaffold(
       appBar: AppBar(
@@ -17,7 +23,7 @@ class CameraScreen extends HookConsumerWidget {
             tooltip: 'Settings',
             iconSize: 32,
             onPressed: () {
-              // TODO: Navigate to settings
+              context.push('/settings');
             },
           ),
         ],
@@ -25,7 +31,7 @@ class CameraScreen extends HookConsumerWidget {
       body: SafeArea(
         child: Column(
           children: [
-            // Placeholder for the camera preview
+            // Camera Preview Section
             Expanded(
               flex: 3,
               child: Container(
@@ -38,21 +44,39 @@ class CameraScreen extends HookConsumerWidget {
                     width: 2,
                   ),
                 ),
-                child: Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(
-                        Icons.camera_alt,
-                        size: 80,
-                        color: theme.colorScheme.onSurfaceVariant,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(22),
+                  child: cameraState.when(
+                    data: (controller) => CameraPreview(controller),
+                    error: (error, stackTrace) => Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.error_outline,
+                            size: 60,
+                            color: theme.colorScheme.error,
+                          ),
+                          const SizedBox(height: 16),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                            child: Text(
+                              'Failed to load camera:\n$error',
+                              style: theme.textTheme.bodyLarge?.copyWith(
+                                color: theme.colorScheme.error,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 16),
-                      Text(
-                        'Camera Preview Offline',
-                        style: theme.textTheme.titleLarge,
+                    ),
+                    loading: () => Center(
+                      child: CircularProgressIndicator(
+                        semanticsLabel: 'Loading camera feed',
+                        color: theme.colorScheme.primary,
                       ),
-                    ],
+                    ),
                   ),
                 ),
               ),
@@ -77,9 +101,15 @@ class CameraScreen extends HookConsumerWidget {
                       width: double.infinity,
                       height: 80, // Extra large tap target
                       child: ElevatedButton.icon(
-                        onPressed: () {
-                          // TODO: Trigger manual capture and AI scan
-                        },
+                        onPressed: cameraState.isLoading || cameraState.hasError 
+                          ? null 
+                          : () async {
+                              final speechService = ref.read(speechServiceProvider);
+                              await speechService.speak('Scanning note. Please hold the camera steady.');
+                              
+                              // TODO: Trigger manual capture and AI scan
+                              // e.g., final image = await cameraState.value!.takePicture();
+                          },
                         icon: const Icon(Icons.document_scanner, size: 36),
                         label: const Text('SCAN NOTE'),
                         style: ElevatedButton.styleFrom(

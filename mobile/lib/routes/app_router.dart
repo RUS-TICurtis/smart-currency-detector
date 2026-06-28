@@ -2,6 +2,7 @@ import 'package:go_router/go_router.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../features/camera/camera_screen.dart';
+import '../features/settings/settings_screen.dart';
 
 final routerProvider = Provider<GoRouter>((ref) {
   return GoRouter(
@@ -12,7 +13,11 @@ final routerProvider = Provider<GoRouter>((ref) {
         name: 'camera',
         builder: (context, state) => const CameraScreen(),
       ),
-      // Add more routes here, like settings
+      GoRoute(
+        path: '/settings',
+        name: 'settings',
+        builder: (context, state) => const SettingsScreen(),
+      ),
     ],
   );
 });
