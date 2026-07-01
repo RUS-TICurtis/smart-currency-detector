@@ -7,7 +7,7 @@ class AIModelService {
   Interpreter? _interpreter;
   List<String>? _labels;
   
-  static const String modelPath = 'assets/model/currency_detector.tflite';
+  static const String modelPath = 'assets/model/best.tflite';
   static const String labelPath = 'assets/model/labels.txt';
   
   // Update this to match your Roboflow model's input size
@@ -41,6 +41,14 @@ class AIModelService {
       final bytes = await File(imagePath).readAsBytes();
       img.Image? image = img.decodeImage(bytes);
       if (image == null) return null;
+      
+      var inputTensor = _interpreter!.getInputTensor(0);
+      print('Model expected input shape: ${inputTensor.shape}');
+      print('Model expected input type: ${inputTensor.type}');
+      
+      var outputTensor = _interpreter!.getOutputTensor(0);
+      print('Model expected output shape: ${outputTensor.shape}');
+
 
       // 2. Resize image to model input size
       img.Image resizedImage = img.copyResize(image, width: inputSize, height: inputSize);
@@ -91,26 +99,30 @@ class AIModelService {
     }
   }
 
-  // Converts an img.Image to a float32 tensor
+  // Converts an img.Image to a float32 tensor in NCHW format [1, 3, inputSize, inputSize]
   List<List<List<List<double>>>> _imageToByteListFloat32(
       img.Image image, int inputSize, double mean, double std) {
+      
     var convertedBytes = List.generate(
-      1,
-      (i) => List.generate(
-        inputSize,
-        (y) => List.generate(
-          inputSize,
-          (x) {
-            final pixel = image.getPixel(x, y);
-            return [
-              (pixel.r - mean) / std,
-              (pixel.g - mean) / std,
-              (pixel.b - mean) / std,
-            ];
-          },
-        ),
-      ),
+      1, 
+      (_) => List.generate(
+        3, 
+        (_) => List.generate(
+          inputSize, 
+          (_) => List.filled(inputSize, 0.0)
+        )
+      )
     );
+
+    for (int y = 0; y < inputSize; y++) {
+      for (int x = 0; x < inputSize; x++) {
+        final pixel = image.getPixel(x, y);
+        convertedBytes[0][0][y][x] = (pixel.r - mean) / std; // R
+        convertedBytes[0][1][y][x] = (pixel.g - mean) / std; // G
+        convertedBytes[0][2][y][x] = (pixel.b - mean) / std; // B
+      }
+    }
+
     return convertedBytes;
   }
 }

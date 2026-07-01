@@ -5,7 +5,7 @@
 # 2. Go to Runtime -> Change runtime type -> Hardware accelerator -> T4 GPU.
 # 3. Upload your Roboflow YOLOv11 dataset zip file to the Colab files pane.
 # 4. Unzip the dataset by running this command in a cell:
-#    !unzip -q your_dataset.zip -d dataset/
+#    !unzip -q "/content/drive/MyDrive/Colab Notebooks/GhanaCediDetection.yolov11.zip" -d /content/dataset
 # 5. Install the ultralytics package by running:
 #    !pip install ultralytics
 # 6. Copy and paste the code below into a new cell and run it!
