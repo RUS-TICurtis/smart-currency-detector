@@ -3,7 +3,10 @@ import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:flutter_hooks/flutter_hooks.dart';
+
 import 'providers/camera_provider.dart';
+import 'providers/ai_provider.dart';
 import '../speech/providers/speech_provider.dart';
 
 class CameraScreen extends HookConsumerWidget {
@@ -13,6 +16,7 @@ class CameraScreen extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final cameraState = ref.watch(cameraControllerProvider);
+    final scanStatus = useState('Ready to scan');
 
     return Scaffold(
       appBar: AppBar(
@@ -91,10 +95,10 @@ class CameraScreen extends HookConsumerWidget {
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [
                     Text(
-                      'Ready to scan',
+                      scanStatus.value,
                       style: theme.textTheme.headlineMedium,
                       textAlign: TextAlign.center,
-                      semanticsLabel: 'Status: Ready to scan currency',
+                      semanticsLabel: 'Status: ${scanStatus.value}',
                     ),
                     const SizedBox(height: 16),
                     SizedBox(
@@ -105,10 +109,28 @@ class CameraScreen extends HookConsumerWidget {
                           ? null 
                           : () async {
                               final speechService = ref.read(speechServiceProvider);
+                              final aiService = ref.read(aiServiceProvider);
+                              
+                              scanStatus.value = 'Scanning note...';
                               await speechService.speak('Scanning note. Please hold the camera steady.');
                               
-                              // TODO: Trigger manual capture and AI scan
-                              // e.g., final image = await cameraState.value!.takePicture();
+                              try {
+                                final xFile = await cameraState.value!.takePicture();
+                                scanStatus.value = 'Analyzing...';
+                                
+                                final prediction = await aiService.predict(xFile.path);
+                                
+                                if (prediction != null) {
+                                  scanStatus.value = 'Detected: $prediction';
+                                  await speechService.speak('Detected $prediction');
+                                } else {
+                                  scanStatus.value = 'Could not detect note.';
+                                  await speechService.speak('Could not clearly detect the note.');
+                                }
+                              } catch (e) {
+                                scanStatus.value = 'Scan failed.';
+                                await speechService.speak('An error occurred during scan.');
+                              }
                           },
                         icon: const Icon(Icons.document_scanner, size: 36),
                         label: const Text('SCAN NOTE'),
