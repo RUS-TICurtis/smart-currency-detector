@@ -51,12 +51,16 @@ class AIModelService {
 
 
       // 2. Resize image preserving aspect ratio (to prevent distortion)
-      img.Image resizedImage;
+      int targetWidth;
+      int targetHeight;
       if (image.width > image.height) {
-        resizedImage = img.copyResize(image, width: inputSize);
+        targetWidth = inputSize;
+        targetHeight = (image.height * inputSize / image.width).round();
       } else {
-        resizedImage = img.copyResize(image, height: inputSize);
+        targetHeight = inputSize;
+        targetWidth = (image.width * inputSize / image.height).round();
       }
+      img.Image resizedImage = img.copyResize(image, width: targetWidth, height: targetHeight);
 
       // 3. Convert image to a 3D float array [1, inputSize, inputSize, 3]
       // YOLOv11 expects inputs scaled between 0.0 and 1.0 (mean=0, std=255)
