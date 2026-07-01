@@ -50,8 +50,13 @@ class AIModelService {
       print('Model expected output shape: ${outputTensor.shape}');
 
 
-      // 2. Resize image to model input size
-      img.Image resizedImage = img.copyResize(image, width: inputSize, height: inputSize);
+      // 2. Resize image preserving aspect ratio (to prevent distortion)
+      img.Image resizedImage;
+      if (image.width > image.height) {
+        resizedImage = img.copyResize(image, width: inputSize);
+      } else {
+        resizedImage = img.copyResize(image, height: inputSize);
+      }
 
       // 3. Convert image to a 3D float array [1, inputSize, inputSize, 3]
       // YOLOv11 expects inputs scaled between 0.0 and 1.0 (mean=0, std=255)
@@ -114,12 +119,23 @@ class AIModelService {
       )
     );
 
+    int dx = (inputSize - image.width) ~/ 2;
+    int dy = (inputSize - image.height) ~/ 2;
+
     for (int y = 0; y < inputSize; y++) {
       for (int x = 0; x < inputSize; x++) {
-        final pixel = image.getPixel(x, y);
-        convertedBytes[0][0][y][x] = (pixel.r - mean) / std; // R
-        convertedBytes[0][1][y][x] = (pixel.g - mean) / std; // G
-        convertedBytes[0][2][y][x] = (pixel.b - mean) / std; // B
+        // Apply letterbox padding if outside the bounds of the resized image
+        if (x < dx || x >= dx + image.width || y < dy || y >= dy + image.height) {
+          double gray = (114.0 - mean) / std; // standard YOLO padding color
+          convertedBytes[0][0][y][x] = gray;
+          convertedBytes[0][1][y][x] = gray;
+          convertedBytes[0][2][y][x] = gray;
+        } else {
+          final pixel = image.getPixel(x - dx, y - dy);
+          convertedBytes[0][0][y][x] = (pixel.r - mean) / std; // R
+          convertedBytes[0][1][y][x] = (pixel.g - mean) / std; // G
+          convertedBytes[0][2][y][x] = (pixel.b - mean) / std; // B
+        }
       }
     }
 
