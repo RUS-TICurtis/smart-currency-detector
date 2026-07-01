@@ -1,9 +1,26 @@
 import 'dart:io';
 import 'dart:isolate';
+import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
+
+class IsolateCameraImage {
+  final int width;
+  final int height;
+  final String formatGroup;
+  final List<IsolatePlane> planes;
+  final int sensorOrientation;
+  IsolateCameraImage(this.width, this.height, this.formatGroup, this.planes, this.sensorOrientation);
+}
+
+class IsolatePlane {
+  final Uint8List bytes;
+  final int bytesPerRow;
+  final int? bytesPerPixel;
+  IsolatePlane(this.bytes, this.bytesPerRow, this.bytesPerPixel);
+}
 
 class AIModelService {
   Interpreter? _interpreter;
@@ -32,106 +49,153 @@ class AIModelService {
     }
   }
 
-  Future<String?> predict(String imagePath) async {
-    if (_interpreter == null || _labels == null) {
-      debugPrint('Interpreter not initialized');
-      return null;
-    }
-
+  Future<String?> predict(String imagePath, double confidenceThreshold) async {
+    if (_interpreter == null || _labels == null) return null;
     try {
-      // 1. Offload image reading, decoding, resizing, and tensor formatting to a background Isolate
-      // This prevents the main UI thread from freezing and drastically reduces memory pressure.
       final input = await Isolate.run(() => _preprocessImage(imagePath, inputSize));
-      
       if (input == null) return null;
-      
-      var inputTensor = _interpreter!.getInputTensor(0);
-      debugPrint('Model expected input shape: ${inputTensor.shape}');
-      debugPrint('Model expected input type: ${inputTensor.type}');
-      
-      var outputTensor = _interpreter!.getOutputTensor(0);
-      debugPrint('Model expected output shape: ${outputTensor.shape}');
-
-      // 4. Get output tensor shape to dynamically allocate buffer
-      // YOLOv11 output shape is typically [1, num_classes + 4, num_anchors] (e.g. [1, 11, 8400])
-      var outputShape = _interpreter!.getOutputTensor(0).shape;
-      int numRows = outputShape[1]; // e.g., 11
-      int numAnchors = outputShape[2]; // e.g., 8400
-
-      // Prepare output buffer
-      var output = List.generate(1, (i) => List.generate(numRows, (j) => List.filled(numAnchors, 0.0)));
-
-      // 5. Run inference
-      _interpreter!.run(input, output);
-
-      // 6. Parse YOLO Output to find the highest confidence class
-      double maxConfidence = 0.0;
-      int bestClassIndex = -1;
-
-      // Iterate through all anchors to find the best detection
-      for (int anchor = 0; anchor < numAnchors; anchor++) {
-        // Classes start at row 4 (after x, y, width, height)
-        for (int cls = 0; cls < _labels!.length; cls++) {
-          double confidence = output[0][cls + 4][anchor];
-          if (confidence > maxConfidence) {
-            maxConfidence = confidence;
-            bestClassIndex = cls;
-          }
-        }
-      }
-
-      debugPrint('Best detection: ${_labels![bestClassIndex]} with confidence $maxConfidence');
-
-      // If confidence is low, return a fallback message
-      if (maxConfidence < 0.5) {
-        return "Could not clearly detect the note. Please try again.";
-      }
-
-      return _labels![bestClassIndex];
+      return _runInference(input, confidenceThreshold);
     } catch (e) {
       debugPrint('Error running inference: $e');
       return null;
     }
   }
 
-  // Preprocesses the image on a background thread to prevent UI freezing
+  Future<String?> predictFromCameraImage(CameraImage image, int sensorOrientation, double confidenceThreshold) async {
+    if (_interpreter == null || _labels == null) return null;
+    try {
+      // Extract bytes on main thread to avoid Isolate serialization errors
+      final planes = image.planes.map((p) => IsolatePlane(
+        p.bytes, p.bytesPerRow, p.bytesPerPixel
+      )).toList();
+      
+      final isolateData = IsolateCameraImage(
+        image.width, image.height, image.format.group.name, planes, sensorOrientation
+      );
+
+      final input = await Isolate.run(() => _preprocessCameraImage(isolateData, inputSize));
+      if (input == null) return null;
+      return _runInference(input, confidenceThreshold);
+    } catch (e) {
+      debugPrint('Error running camera inference: $e');
+      return null;
+    }
+  }
+
+  String? _runInference(List<List<List<List<double>>>> input, double confidenceThreshold) {
+    var outputShape = _interpreter!.getOutputTensor(0).shape;
+    int numRows = outputShape[1]; 
+    int numAnchors = outputShape[2]; 
+
+    var output = List.generate(1, (i) => List.generate(numRows, (j) => List.filled(numAnchors, 0.0)));
+    _interpreter!.run(input, output);
+
+    double maxConfidence = 0.0;
+    int bestClassIndex = -1;
+
+    for (int anchor = 0; anchor < numAnchors; anchor++) {
+      for (int cls = 0; cls < _labels!.length; cls++) {
+        double confidence = output[0][cls + 4][anchor];
+        if (confidence > maxConfidence) {
+          maxConfidence = confidence;
+          bestClassIndex = cls;
+        }
+      }
+    }
+
+    if (maxConfidence < confidenceThreshold) {
+      return null; // Return null when nothing is clearly detected
+    }
+
+    return _labels![bestClassIndex];
+  }
+
   static List<List<List<List<double>>>>? _preprocessImage(String imagePath, int inputSize) {
     try {
       final bytes = File(imagePath).readAsBytesSync();
       img.Image? image = img.decodeImage(bytes);
       if (image == null) return null;
-
-      int targetWidth;
-      int targetHeight;
-      if (image.width > image.height) {
-        targetWidth = inputSize;
-        targetHeight = (image.height * inputSize / image.width).round();
-      } else {
-        targetHeight = inputSize;
-        targetWidth = (image.width * inputSize / image.height).round();
-      }
-      img.Image resizedImage = img.copyResize(image, width: targetWidth, height: targetHeight);
-
-      return _imageToByteListFloat32(resizedImage, inputSize, 0, 255.0);
+      return _resizeAndFormat(image, inputSize);
     } catch (e) {
-      debugPrint('Preprocessing error in isolate: $e');
       return null;
     }
   }
 
-  // Converts an img.Image to a float32 tensor in NCHW format [1, 3, inputSize, inputSize]
+  static List<List<List<List<double>>>>? _preprocessCameraImage(IsolateCameraImage data, int inputSize) {
+    try {
+      img.Image? image;
+      
+      if (data.formatGroup == 'yuv420') {
+        image = img.Image(width: data.width, height: data.height);
+        final int uRowStride = data.planes[1].bytesPerRow;
+        final int uPixelStride = data.planes[1].bytesPerPixel ?? 1;
+        
+        final int vRowStride = data.planes[2].bytesPerRow;
+        final int vPixelStride = data.planes[2].bytesPerPixel ?? 1;
+
+        for (int w = 0; w < data.width; w++) {
+          for (int h = 0; h < data.height; h++) {
+            final int uIndex = uPixelStride * (w ~/ 2) + uRowStride * (h ~/ 2);
+            final int vIndex = vPixelStride * (w ~/ 2) + vRowStride * (h ~/ 2);
+            final int index = h * data.planes[0].bytesPerRow + w;
+
+            final y = data.planes[0].bytes[index];
+            final u = data.planes[1].bytes[uIndex];
+            final v = data.planes[2].bytes[vIndex];
+
+            double yVal = y.toDouble();
+            double uVal = u.toDouble() - 128.0;
+            double vVal = v.toDouble() - 128.0;
+
+            int r = (yVal + 1.402 * vVal).round().clamp(0, 255);
+            int g = (yVal - 0.344136 * uVal - 0.714136 * vVal).round().clamp(0, 255);
+            int b = (yVal + 1.772 * uVal).round().clamp(0, 255);
+            
+            image.setPixelRgb(w, h, r, g, b);
+          }
+        }
+      } else if (data.formatGroup == 'bgra8888') {
+        image = img.Image.fromBytes(
+          width: data.width, 
+          height: data.height, 
+          bytes: data.planes[0].bytes.buffer, 
+          order: img.ChannelOrder.bgra
+        );
+      } else {
+        return null;
+      }
+      
+      // Fix rotation before resizing
+      if (data.sensorOrientation != 0) {
+        image = img.copyRotate(image, angle: data.sensorOrientation);
+      }
+
+      return _resizeAndFormat(image, inputSize);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  static List<List<List<List<double>>>> _resizeAndFormat(img.Image image, int inputSize) {
+    int targetWidth;
+    int targetHeight;
+    if (image.width > image.height) {
+      targetWidth = inputSize;
+      targetHeight = (image.height * inputSize / image.width).round();
+    } else {
+      targetHeight = inputSize;
+      targetWidth = (image.width * inputSize / image.height).round();
+    }
+    
+    img.Image resizedImage = img.copyResize(image, width: targetWidth, height: targetHeight, interpolation: img.Interpolation.linear);
+    return _imageToByteListFloat32(resizedImage, inputSize, 0, 255.0);
+  }
+
   static List<List<List<List<double>>>> _imageToByteListFloat32(
       img.Image image, int inputSize, double mean, double std) {
       
     var convertedBytes = List.generate(
-      1, 
-      (_) => List.generate(
-        3, 
-        (_) => List.generate(
-          inputSize, 
-          (_) => List.filled(inputSize, 0.0)
-        )
-      )
+      1, (_) => List.generate(3, (_) => List.generate(inputSize, (_) => List.filled(inputSize, 0.0)))
     );
 
     int dx = (inputSize - image.width) ~/ 2;
@@ -139,21 +203,19 @@ class AIModelService {
 
     for (int y = 0; y < inputSize; y++) {
       for (int x = 0; x < inputSize; x++) {
-        // Apply letterbox padding if outside the bounds of the resized image
         if (x < dx || x >= dx + image.width || y < dy || y >= dy + image.height) {
-          double gray = (114.0 - mean) / std; // standard YOLO padding color
+          double gray = (114.0 - mean) / std; 
           convertedBytes[0][0][y][x] = gray;
           convertedBytes[0][1][y][x] = gray;
           convertedBytes[0][2][y][x] = gray;
         } else {
           final pixel = image.getPixel(x - dx, y - dy);
-          convertedBytes[0][0][y][x] = (pixel.r - mean) / std; // R
-          convertedBytes[0][1][y][x] = (pixel.g - mean) / std; // G
-          convertedBytes[0][2][y][x] = (pixel.b - mean) / std; // B
+          convertedBytes[0][0][y][x] = (pixel.r - mean) / std; 
+          convertedBytes[0][1][y][x] = (pixel.g - mean) / std; 
+          convertedBytes[0][2][y][x] = (pixel.b - mean) / std; 
         }
       }
     }
-
     return convertedBytes;
   }
 }

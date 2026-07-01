@@ -86,6 +86,95 @@ class SettingsScreen extends HookConsumerWidget {
                   ),
                 ],
               ),
+              const SizedBox(height: 32),
+
+              // Camera Zoom Slider
+              Text(
+                'Camera Zoom',
+                style: theme.textTheme.titleLarge,
+                semanticsLabel: 'Camera Zoom Adjustment',
+              ),
+              Row(
+                children: [
+                  const Icon(Icons.zoom_in, size: 32),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Slider(
+                      value: settings.cameraZoom,
+                      min: 1.0,
+                      max: 3.0,
+                      divisions: 8,
+                      label: '${settings.cameraZoom.toStringAsFixed(1)}x',
+                      onChanged: (value) {
+                        settingsNotifier.updateCameraZoom(value);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 32),
+
+              // Confidence Threshold Slider
+              Text(
+                'AI Strictness (Confidence)',
+                style: theme.textTheme.titleLarge,
+                semanticsLabel: 'AI Strictness Adjustment',
+              ),
+              Text(
+                'Higher strictness prevents false positives but may require better lighting.',
+                style: theme.textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  const Icon(Icons.analytics, size: 32),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Slider(
+                      value: settings.confidenceThreshold,
+                      min: 0.5,
+                      max: 0.95,
+                      divisions: 9,
+                      label: '${(settings.confidenceThreshold * 100).round()}%',
+                      onChanged: (value) {
+                        settingsNotifier.updateConfidenceThreshold(value);
+                      },
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 32),
+
+              // Auto-Scan Toggle
+              Text(
+                'Auto-Scan Mode',
+                style: theme.textTheme.titleLarge,
+                semanticsLabel: 'Auto-Scan Mode Toggle',
+              ),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Text(
+                      'Automatically detect notes without pressing a button. This uses more battery.',
+                      style: theme.textTheme.bodyMedium,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Switch(
+                    value: settings.autoScan,
+                    onChanged: (value) {
+                      settingsNotifier.updateAutoScan(value);
+                      if (value) {
+                        speechService.speak('Auto scan enabled');
+                      } else {
+                        speechService.speak('Auto scan disabled');
+                      }
+                    },
+                  ),
+                ],
+              ),
             ],
           ),
         ),

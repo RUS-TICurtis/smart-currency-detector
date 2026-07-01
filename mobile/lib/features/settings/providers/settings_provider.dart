@@ -10,13 +10,31 @@ final settingsServiceProvider = Provider<SettingsService>((ref) {
 class SettingsState {
   final double speechRate;
   final double speechVolume;
+  final bool autoScan;
+  final double cameraZoom;
+  final double confidenceThreshold;
 
-  SettingsState({required this.speechRate, required this.speechVolume});
+  SettingsState({
+    required this.speechRate, 
+    required this.speechVolume, 
+    required this.autoScan,
+    required this.cameraZoom,
+    required this.confidenceThreshold,
+  });
 
-  SettingsState copyWith({double? speechRate, double? speechVolume}) {
+  SettingsState copyWith({
+    double? speechRate, 
+    double? speechVolume, 
+    bool? autoScan,
+    double? cameraZoom,
+    double? confidenceThreshold,
+  }) {
     return SettingsState(
       speechRate: speechRate ?? this.speechRate,
       speechVolume: speechVolume ?? this.speechVolume,
+      autoScan: autoScan ?? this.autoScan,
+      cameraZoom: cameraZoom ?? this.cameraZoom,
+      confidenceThreshold: confidenceThreshold ?? this.confidenceThreshold,
     );
   }
 }
@@ -30,6 +48,9 @@ class SettingsNotifier extends Notifier<SettingsState> {
     return SettingsState(
       speechRate: _settingsService.speechRate,
       speechVolume: _settingsService.speechVolume,
+      autoScan: _settingsService.autoScan,
+      cameraZoom: _settingsService.cameraZoom,
+      confidenceThreshold: _settingsService.confidenceThreshold,
     );
   }
 
@@ -41,6 +62,21 @@ class SettingsNotifier extends Notifier<SettingsState> {
   Future<void> updateSpeechVolume(double volume) async {
     await _settingsService.setSpeechVolume(volume);
     state = state.copyWith(speechVolume: volume);
+  }
+
+  Future<void> updateAutoScan(bool enabled) async {
+    await _settingsService.setAutoScan(enabled);
+    state = state.copyWith(autoScan: enabled);
+  }
+
+  Future<void> updateCameraZoom(double zoom) async {
+    await _settingsService.setCameraZoom(zoom);
+    state = state.copyWith(cameraZoom: zoom);
+  }
+
+  Future<void> updateConfidenceThreshold(double threshold) async {
+    await _settingsService.setConfidenceThreshold(threshold);
+    state = state.copyWith(confidenceThreshold: threshold);
   }
 }
 

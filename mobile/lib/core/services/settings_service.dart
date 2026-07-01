@@ -21,4 +21,31 @@ class SettingsService {
   Future<void> setSpeechVolume(double value) async {
     await _box.put(_speechVolumeKey, value);
   }
+
+  static const String _autoScanKey = 'autoScan';
+  static const bool defaultAutoScan = false;
+
+  bool get autoScan => _box.get(_autoScanKey, defaultValue: defaultAutoScan) as bool;
+  
+  Future<void> setAutoScan(bool value) async {
+    await _box.put(_autoScanKey, value);
+  }
+
+  static const String _cameraZoomKey = 'cameraZoom';
+  static const double defaultCameraZoom = 1.0;
+
+  double get cameraZoom => _box.get(_cameraZoomKey, defaultValue: defaultCameraZoom) as double;
+  
+  Future<void> setCameraZoom(double value) async {
+    await _box.put(_cameraZoomKey, value);
+  }
+
+  static const String _confidenceThresholdKey = 'confidenceThreshold';
+  static const double defaultConfidenceThreshold = 0.75;
+
+  double get confidenceThreshold => _box.get(_confidenceThresholdKey, defaultValue: defaultConfidenceThreshold) as double;
+
+  Future<void> setConfidenceThreshold(double value) async {
+    await _box.put(_confidenceThresholdKey, value);
+  }
 }
