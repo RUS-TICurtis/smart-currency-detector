@@ -16,11 +16,11 @@ final cameraControllerProvider = FutureProvider.autoDispose<CameraController>((r
   );
 
   // Initialize the camera controller
-  // We use max resolution for better AI inference later, but medium is faster
+  // We use medium resolution as 1080p is overkill for a 640x640 AI model
   // Setting enableAudio to false to avoid microphone permissions
   final controller = CameraController(
     backCamera,
-    ResolutionPreset.high,
+    ResolutionPreset.medium,
     enableAudio: false,
   );
 

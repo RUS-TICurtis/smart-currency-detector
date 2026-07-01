@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'dart:isolate';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
@@ -24,47 +26,31 @@ class AIModelService {
       final labelData = await rootBundle.loadString(labelPath);
       _labels = labelData.split('\n').where((label) => label.isNotEmpty).toList();
       
-      print('Model and labels loaded successfully');
+      debugPrint('Model and labels loaded successfully');
     } catch (e) {
-      print('Failed to load model: $e');
+      debugPrint('Failed to load model: $e');
     }
   }
 
   Future<String?> predict(String imagePath) async {
     if (_interpreter == null || _labels == null) {
-      print('Interpreter not initialized');
+      debugPrint('Interpreter not initialized');
       return null;
     }
 
     try {
-      // 1. Read and decode the image file
-      final bytes = await File(imagePath).readAsBytes();
-      img.Image? image = img.decodeImage(bytes);
-      if (image == null) return null;
+      // 1. Offload image reading, decoding, resizing, and tensor formatting to a background Isolate
+      // This prevents the main UI thread from freezing and drastically reduces memory pressure.
+      final input = await Isolate.run(() => _preprocessImage(imagePath, inputSize));
+      
+      if (input == null) return null;
       
       var inputTensor = _interpreter!.getInputTensor(0);
-      print('Model expected input shape: ${inputTensor.shape}');
-      print('Model expected input type: ${inputTensor.type}');
+      debugPrint('Model expected input shape: ${inputTensor.shape}');
+      debugPrint('Model expected input type: ${inputTensor.type}');
       
       var outputTensor = _interpreter!.getOutputTensor(0);
-      print('Model expected output shape: ${outputTensor.shape}');
-
-
-      // 2. Resize image preserving aspect ratio (to prevent distortion)
-      int targetWidth;
-      int targetHeight;
-      if (image.width > image.height) {
-        targetWidth = inputSize;
-        targetHeight = (image.height * inputSize / image.width).round();
-      } else {
-        targetHeight = inputSize;
-        targetWidth = (image.width * inputSize / image.height).round();
-      }
-      img.Image resizedImage = img.copyResize(image, width: targetWidth, height: targetHeight);
-
-      // 3. Convert image to a 3D float array [1, inputSize, inputSize, 3]
-      // YOLOv11 expects inputs scaled between 0.0 and 1.0 (mean=0, std=255)
-      var input = _imageToByteListFloat32(resizedImage, inputSize, 0, 255.0);
+      debugPrint('Model expected output shape: ${outputTensor.shape}');
 
       // 4. Get output tensor shape to dynamically allocate buffer
       // YOLOv11 output shape is typically [1, num_classes + 4, num_anchors] (e.g. [1, 11, 8400])
@@ -94,7 +80,7 @@ class AIModelService {
         }
       }
 
-      print('Best detection: ${_labels![bestClassIndex]} with confidence $maxConfidence');
+      debugPrint('Best detection: ${_labels![bestClassIndex]} with confidence $maxConfidence');
 
       // If confidence is low, return a fallback message
       if (maxConfidence < 0.5) {
@@ -103,13 +89,38 @@ class AIModelService {
 
       return _labels![bestClassIndex];
     } catch (e) {
-      print('Error running inference: $e');
+      debugPrint('Error running inference: $e');
+      return null;
+    }
+  }
+
+  // Preprocesses the image on a background thread to prevent UI freezing
+  static List<List<List<List<double>>>>? _preprocessImage(String imagePath, int inputSize) {
+    try {
+      final bytes = File(imagePath).readAsBytesSync();
+      img.Image? image = img.decodeImage(bytes);
+      if (image == null) return null;
+
+      int targetWidth;
+      int targetHeight;
+      if (image.width > image.height) {
+        targetWidth = inputSize;
+        targetHeight = (image.height * inputSize / image.width).round();
+      } else {
+        targetHeight = inputSize;
+        targetWidth = (image.width * inputSize / image.height).round();
+      }
+      img.Image resizedImage = img.copyResize(image, width: targetWidth, height: targetHeight);
+
+      return _imageToByteListFloat32(resizedImage, inputSize, 0, 255.0);
+    } catch (e) {
+      debugPrint('Preprocessing error in isolate: $e');
       return null;
     }
   }
 
   // Converts an img.Image to a float32 tensor in NCHW format [1, 3, inputSize, inputSize]
-  List<List<List<List<double>>>> _imageToByteListFloat32(
+  static List<List<List<List<double>>>> _imageToByteListFloat32(
       img.Image image, int inputSize, double mean, double std) {
       
     var convertedBytes = List.generate(
