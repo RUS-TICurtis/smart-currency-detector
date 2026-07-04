@@ -140,10 +140,7 @@ class AIModelService {
   // ---------------------------------------------------------------------------
 
   /// Run inference on a still image at [imagePath] (gallery / takePicture).
-  Future<String?> predict(
-    String imagePath,
-    double confidenceThreshold,
-  ) async {
+  Future<String?> predict(String imagePath, double confidenceThreshold) async {
     if (!_isReady) return null;
     try {
       // Preprocessing is CPU-heavy — offload to a background isolate.
@@ -170,11 +167,9 @@ class AIModelService {
       // Serialise plane data for isolate transfer.
       // FIX (C-05): default bytesPerPixel to 2 for Android NV12/NV21 UV planes.
       final planes = image.planes
-          .map((p) => IsolatePlane(
-                p.bytes,
-                p.bytesPerRow,
-                p.bytesPerPixel ?? 2,
-              ))
+          .map(
+            (p) => IsolatePlane(p.bytes, p.bytesPerRow, p.bytesPerPixel ?? 2),
+          )
           .toList();
 
       final isolateData = IsolateCameraImage(
@@ -220,10 +215,8 @@ class AIModelService {
     // Allocate the output buffer that tflite_flutter will write into.
     final output = List.generate(
       1,
-      (_) => List.generate(
-        numRows,
-        (_) => List<double>.filled(numAnchors, 0.0),
-      ),
+      (_) =>
+          List.generate(numRows, (_) => List<double>.filled(numAnchors, 0.0)),
     );
 
     _interpreter!.run(input4D, output);
@@ -253,14 +246,16 @@ class AIModelService {
       final w = output[0][2][a];
       final h = output[0][3][a];
 
-      detections.add(_Detection(
-        bestClass,
-        maxScore,
-        cx - w / 2, // x1
-        cy - h / 2, // y1
-        cx + w / 2, // x2
-        cy + h / 2, // y2
-      ));
+      detections.add(
+        _Detection(
+          bestClass,
+          maxScore,
+          cx - w / 2, // x1
+          cy - h / 2, // y1
+          cx + w / 2, // x2
+          cy + h / 2, // y2
+        ),
+      );
     }
 
     if (detections.isEmpty) return null;
@@ -338,17 +333,14 @@ class AIModelService {
       1,
       (_) => List.generate(
         3,
-        (c) => List.generate(
-          inputSize,
-          (y) {
-            final row = List<double>.filled(inputSize, 0.0);
-            final base = c * inputSize * inputSize + y * inputSize;
-            for (int x = 0; x < inputSize; x++) {
-              row[x] = buffer[base + x];
-            }
-            return row;
-          },
-        ),
+        (c) => List.generate(inputSize, (y) {
+          final row = List<double>.filled(inputSize, 0.0);
+          final base = c * inputSize * inputSize + y * inputSize;
+          for (int x = 0; x < inputSize; x++) {
+            row[x] = buffer[base + x];
+          }
+          return row;
+        }),
       ),
     );
   }
@@ -431,8 +423,10 @@ class AIModelService {
         final vVal = vPlane.bytes[vIndex].toDouble() - 128.0;
 
         final r = (yVal + 1.402 * vVal).round().clamp(0, 255);
-        final g =
-            (yVal - 0.344136 * uVal - 0.714136 * vVal).round().clamp(0, 255);
+        final g = (yVal - 0.344136 * uVal - 0.714136 * vVal).round().clamp(
+          0,
+          255,
+        );
         final b = (yVal + 1.772 * uVal).round().clamp(0, 255);
 
         output.setPixelRgb(w, h, r, g, b);
