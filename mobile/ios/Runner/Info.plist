@@ -68,5 +68,7 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>This app needs camera access to scan and detect currency notes.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>This app needs photo library access to analyse currency note images from your gallery.</string>
 </dict>
 </plist>

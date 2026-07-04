@@ -1,17 +1,42 @@
-import 'dart:async';
 import 'dart:ui';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:go_router/go_router.dart';
-
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import 'providers/camera_provider.dart';
 import 'providers/ai_provider.dart';
 import '../speech/providers/speech_provider.dart';
 import '../settings/providers/settings_provider.dart';
+
+// ---------------------------------------------------------------------------
+// Lifecycle observer — pauses the camera stream and torch when the OS
+// backgrounds the app, then lets the autoScan effect resume them.
+// ---------------------------------------------------------------------------
+
+class _CameraLifecycleObserver extends WidgetsBindingObserver {
+  final VoidCallback onPause;
+  final VoidCallback onResume;
+
+  _CameraLifecycleObserver({required this.onPause, required this.onResume});
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive) {
+      onPause();
+    } else if (state == AppLifecycleState.resumed) {
+      onResume();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Camera Screen
+// ---------------------------------------------------------------------------
 
 class CameraScreen extends HookConsumerWidget {
   const CameraScreen({super.key});
@@ -20,158 +45,284 @@ class CameraScreen extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final theme = Theme.of(context);
     final cameraState = ref.watch(cameraControllerProvider);
+    final aiState = ref.watch(aiServiceProvider); // FutureProvider<AIModelService>
     final settings = ref.watch(settingsProvider);
-    final scanStatus = useState('Ready to scan');
+
+    // ── Local state ──
+    final scanStatus = useState('Loading model...');
     final isProcessing = useState(false);
     final isFlashOn = useState(false);
-    
+
+    // FIX (H-04): Track mount state via a ValueNotifier so async callbacks
+    // can safely check before calling setState on a disposed widget.
+    // useIsMounted() is deprecated on Flutter 3.7+; we use a manual
+    // WidgetsBinding post-frame guard instead.
+    bool disposed = false;
+    useEffect(() {
+      return () { disposed = true; };
+    }, const []);
+    bool isMounted() => !disposed;
+
+    // Internal refs — mutations don't need to trigger a rebuild.
     final latestImage = useRef<CameraImage?>(null);
     final lastAutoScanTime = useRef<DateTime>(DateTime.now());
+    // FIX (C-04): sliding window for majority-vote consensus (max 5 entries).
     final detectionHistory = useRef<List<String>>([]);
 
-    // Auto-Scan & Live Stream Logic
+    // Update status when model/camera become ready
     useEffect(() {
-      if (cameraState.hasValue && !cameraState.isLoading && !cameraState.hasError) {
-        final controller = cameraState.value!;
-        
-        // Apply camera zoom setting safely
-        controller.setZoomLevel(settings.cameraZoom).catchError((e) {
-          debugPrint('Failed to set zoom: $e');
-        });
-
-        // 1. Battery Optimization: Only start stream if autoScan is enabled
-        if (settings.autoScan) {
-          if (!controller.value.isStreamingImages) {
-            controller.startImageStream((image) {
-              latestImage.value = image;
-              
-              if (!isProcessing.value) {
-                final now = DateTime.now();
-                if (now.difference(lastAutoScanTime.value) > const Duration(seconds: 2)) {
-                  lastAutoScanTime.value = now;
-                  
-                  isProcessing.value = true;
-                  scanStatus.value = 'Auto-scanning...';
-                  
-                  final aiService = ref.read(aiServiceProvider);
-                  aiService.predictFromCameraImage(image, controller.description.sensorOrientation, settings.confidenceThreshold).then((prediction) {
-                    if (prediction != null) {
-                      // Multi-Frame Consensus logic
-                      detectionHistory.value.add(prediction);
-                      if (detectionHistory.value.length >= 3) {
-                        // Check if the last 3 detections are the same
-                        bool allSame = detectionHistory.value.every((p) => p == prediction);
-                        if (allSame) {
-                          scanStatus.value = 'Detected: $prediction';
-                          ref.read(speechServiceProvider).speak('Detected $prediction');
-                          detectionHistory.value.clear(); // Reset history after speaking
-                        } else {
-                          // Keep only the last 3 elements
-                          detectionHistory.value.removeAt(0);
-                        }
-                      } else {
-                        scanStatus.value = 'Verifying...';
-                      }
-                    } else {
-                      detectionHistory.value.clear(); // Reset if we lose confidence
-                      scanStatus.value = 'Scanning...';
-                    }
-                    isProcessing.value = false;
-                  }).catchError((e) {
-                    isProcessing.value = false;
-                  });
-                }
-              }
-            });
-          }
-        } else {
-          // Auto-Scan is OFF -> Stop streaming to save battery
-          if (controller.value.isStreamingImages) {
-            controller.stopImageStream();
-            latestImage.value = null; // Clear stale frames
-          }
+      if (aiState.hasError) {
+        scanStatus.value = 'Model failed to load.';
+      } else if (aiState.isLoading) {
+        scanStatus.value = 'Loading model...';
+      } else if (cameraState.hasValue && !cameraState.isLoading) {
+        // Only update status if not currently scanning
+        if (scanStatus.value == 'Loading model...') {
+          scanStatus.value = 'Ready to scan';
         }
       }
-      
+      return null;
+    }, [aiState.isLoading, aiState.hasError, cameraState.hasValue]);
+
+    // ── Effect 1: Apply zoom (FIX M-10: separated from stream effect) ──
+    useEffect(() {
+      if (cameraState.hasValue &&
+          !cameraState.isLoading &&
+          !cameraState.hasError) {
+        cameraState.value!.setZoomLevel(settings.cameraZoom).catchError((e) {
+          debugPrint('Failed to set zoom: $e');
+        });
+      }
+      return null;
+    }, [cameraState.hasValue, settings.cameraZoom]);
+
+    // ── Effect 2: Lifecycle observer — pause/resume camera resources ──
+    // FIX (H-06, M-07): stop stream and torch when app is backgrounded.
+    useEffect(() {
+      if (!cameraState.hasValue ||
+          cameraState.isLoading ||
+          cameraState.hasError) {
+        return null;
+      }
+
+      final controller = cameraState.value!;
+
+      final observer = _CameraLifecycleObserver(
+        onPause: () {
+          // Stop the image stream to release camera & save battery.
+          if (controller.value.isStreamingImages) {
+            controller.stopImageStream().catchError((_) {});
+          }
+          // Turn off torch — the OS may revoke it anyway; ensure state is synced.
+          if (isFlashOn.value) {
+            controller.setFlashMode(FlashMode.off).catchError((_) {});
+            if (isMounted()) isFlashOn.value = false;
+          }
+        },
+        onResume: () {
+          // The autoScan effect (Effect 3) will restart the stream if needed.
+          debugPrint('CameraScreen: app resumed.');
+        },
+      );
+
+      WidgetsBinding.instance.addObserver(observer);
+      return () => WidgetsBinding.instance.removeObserver(observer);
+    }, [cameraState.hasValue, cameraState.isLoading, cameraState.hasError]);
+
+    // ── Effect 3: Auto-scan stream (FIX C-04, H-04, M-02, M-10) ──
+    useEffect(() {
+      final cameraReady = cameraState.hasValue &&
+          !cameraState.isLoading &&
+          !cameraState.hasError;
+      final aiReady =
+          aiState.hasValue && !aiState.isLoading && !aiState.hasError;
+
+      if (!cameraReady || !aiReady) return null;
+
+      final controller = cameraState.value!;
+      final aiService = aiState.value!;
+
+      if (settings.autoScan) {
+        if (!controller.value.isStreamingImages) {
+          controller.startImageStream((image) {
+            latestImage.value = image;
+
+            if (isProcessing.value) return;
+
+            final now = DateTime.now();
+            // FIX (M-02): reduced debounce from 2 s → 800 ms for faster
+            // consensus convergence (3 votes × 800 ms = min 2.4 s to confirm).
+            if (now.difference(lastAutoScanTime.value) <
+                const Duration(milliseconds: 800)) {
+              return;
+            }
+            lastAutoScanTime.value = now;
+            isProcessing.value = true;
+
+            aiService
+                .predictFromCameraImage(
+                  image,
+                  controller.description.sensorOrientation,
+                  settings.confidenceThreshold,
+                )
+                .then((prediction) {
+              // FIX (H-04): guard against post-dispose state mutation.
+              if (!isMounted()) return;
+
+              final history = detectionHistory.value;
+
+              if (prediction != null) {
+                // ── FIX (C-04): Majority-vote sliding window ──
+                // Add to window and cap at 5 entries.
+                history.add(prediction);
+                if (history.length > 5) history.removeAt(0);
+
+                // Count votes for each label in the window.
+                final counts = <String, int>{};
+                for (final p in history) {
+                  counts[p] = (counts[p] ?? 0) + 1;
+                }
+
+                // Find the label with the most votes.
+                final best = counts.entries
+                    .reduce((a, b) => a.value >= b.value ? a : b);
+
+                if (best.value >= 3) {
+                  // Majority reached — announce and reset the window.
+                  scanStatus.value = 'Detected: ${best.key}';
+                  ref
+                      .read(speechServiceProvider)
+                      .speak('Detected ${best.key}');
+                  history.clear();
+                } else {
+                  scanStatus.value =
+                      'Verifying... (${history.length}/5)';
+                }
+              } else {
+                // No detection: age out the oldest entry so the window stays
+                // fresh but doesn't immediately discard valid prior detections.
+                if (history.isNotEmpty) history.removeAt(0);
+                if (history.isEmpty) scanStatus.value = 'Scanning...';
+              }
+
+              isProcessing.value = false;
+            }).catchError((e) {
+              if (!isMounted()) return;
+              isProcessing.value = false;
+              debugPrint('Auto-scan error: $e');
+            });
+          });
+        }
+      } else {
+        // Auto-scan turned off — stop the stream and clear stale state.
+        if (controller.value.isStreamingImages) {
+          controller.stopImageStream().catchError((_) {});
+          latestImage.value = null;
+          detectionHistory.value.clear();
+        }
+      }
+
       return () {
-        if (cameraState.hasValue && cameraState.value!.value.isStreamingImages) {
-          cameraState.value!.stopImageStream();
+        if (controller.value.isStreamingImages) {
+          controller.stopImageStream().catchError((_) {});
         }
       };
-    }, [cameraState.hasValue, settings.autoScan, settings.cameraZoom, settings.confidenceThreshold]);
+    }, [
+      cameraState.hasValue,
+      aiState.hasValue,
+      settings.autoScan,
+      settings.confidenceThreshold,
+    ]);
+
+    // ── Convenience booleans for the UI ──
+    final cameraLoading = cameraState.isLoading;
+    final cameraError = cameraState.hasError;
+    final aiLoading = aiState.isLoading;
+    final aiError = aiState.hasError;
+    final systemBusy = cameraLoading || cameraError || aiLoading || aiError;
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // 1. Full-Screen Camera Background (Uncropped AR style)
+          // ── 1. Full-screen camera preview ──
           Positioned.fill(
             child: cameraState.when(
-              data: (controller) {
-                return Container(
-                  color: Colors.black,
-                  child: Center(
-                    child: CameraPreview(controller),
-                  ),
-                );
-              },
-              error: (error, stackTrace) => Center(
+              data: (controller) => Container(
+                color: Colors.black,
+                child: Center(child: CameraPreview(controller)),
+              ),
+              error: (error, _) => _buildCameraError(
+                context,
+                theme,
+                error,
+                ref,
+              ),
+              loading: () => const Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Icon(Icons.error_outline, size: 60, color: theme.colorScheme.error),
-                    const SizedBox(height: 16),
+                    CircularProgressIndicator(),
+                    SizedBox(height: 16),
                     Text(
-                      'Failed to load camera:\n$error',
-                      style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.error),
-                      textAlign: TextAlign.center,
+                      'Initialising camera...',
+                      style: TextStyle(color: Colors.white70),
                     ),
                   ],
                 ),
               ),
-              loading: () => const Center(child: CircularProgressIndicator()),
             ),
           ),
 
-          // 2. Floating Action Buttons (Top Right)
+          // ── 2. Top-right floating buttons ──
           Positioned(
             top: MediaQuery.paddingOf(context).top + 16,
             right: 16,
             child: Column(
               children: [
-                // Settings Button
+                // Settings
                 Container(
-                  decoration: BoxDecoration(color: Colors.black.withOpacity(0.4), shape: BoxShape.circle),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.4),
+                    shape: BoxShape.circle,
+                  ),
                   child: IconButton(
                     icon: const Icon(Icons.settings, color: Colors.white),
                     tooltip: 'Settings',
                     iconSize: 28,
-                    onPressed: () {
-                      context.push('/settings');
-                    },
+                    onPressed: () => context.push('/settings'),
                   ),
                 ),
                 const SizedBox(height: 16),
-                // Flashlight Button
-                if (cameraState.hasValue && !cameraState.isLoading && !cameraState.hasError)
+
+                // Torch (only shown when camera is ready)
+                if (cameraState.hasValue &&
+                    !cameraState.isLoading &&
+                    !cameraState.hasError)
                   Container(
                     decoration: BoxDecoration(
-                      color: isFlashOn.value ? theme.colorScheme.primary : Colors.black.withOpacity(0.4), 
-                      shape: BoxShape.circle
+                      color: isFlashOn.value
+                          ? theme.colorScheme.primary
+                          : Colors.black.withValues(alpha: 0.4),
+                      shape: BoxShape.circle,
                     ),
                     child: IconButton(
                       icon: Icon(
-                        isFlashOn.value ? Icons.flash_on : Icons.flash_off, 
-                        color: isFlashOn.value ? theme.colorScheme.onPrimary : Colors.white
+                        isFlashOn.value ? Icons.flash_on : Icons.flash_off,
+                        color: isFlashOn.value
+                            ? theme.colorScheme.onPrimary
+                            : Colors.white,
                       ),
                       tooltip: 'Toggle Flashlight',
                       iconSize: 28,
                       onPressed: () async {
                         final controller = cameraState.value!;
                         try {
-                          final newMode = isFlashOn.value ? FlashMode.off : FlashMode.torch;
+                          final newMode = isFlashOn.value
+                              ? FlashMode.off
+                              : FlashMode.torch;
                           await controller.setFlashMode(newMode);
-                          isFlashOn.value = !isFlashOn.value;
+                          if (isMounted()) isFlashOn.value = !isFlashOn.value;
                         } catch (e) {
                           debugPrint('Failed to toggle flash: $e');
                         }
@@ -182,7 +333,40 @@ class CameraScreen extends HookConsumerWidget {
             ),
           ),
 
-          // 3. Floating Interaction Area (Bottom)
+          // ── 3. AI model loading overlay ──
+          if (aiLoading)
+            Positioned(
+              top: MediaQuery.paddingOf(context).top + 16,
+              left: 16,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.black.withValues(alpha: 0.6),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: const Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      'Loading AI model...',
+                      style: TextStyle(color: Colors.white, fontSize: 13),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // ── 4. Bottom interaction panel ──
           Positioned(
             bottom: 0,
             left: 0,
@@ -198,114 +382,201 @@ class CameraScreen extends HookConsumerWidget {
                     bottom: MediaQuery.paddingOf(context).bottom + 24,
                   ),
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.surface.withOpacity(0.75),
+                    color: theme.colorScheme.surface.withValues(alpha: 0.75),
                     border: Border(
-                      top: BorderSide(color: theme.colorScheme.outline.withOpacity(0.2), width: 1),
+                      top: BorderSide(
+                        color: theme.colorScheme.outline.withValues(alpha: 0.2),
+                        width: 1,
+                      ),
                     ),
                   ),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      // Status Text
+                      // Status text
                       Text(
                         scanStatus.value,
-                        style: theme.textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.bold),
+                        style: theme.textTheme.headlineMedium
+                            ?.copyWith(fontWeight: FontWeight.bold),
                         textAlign: TextAlign.center,
                         semanticsLabel: 'Status: ${scanStatus.value}',
                       ),
                       const SizedBox(height: 24),
-                      
-                      // Action Buttons
+
+                      // Action buttons
                       Row(
                         children: [
+                          // ── SCAN NOTE ──
                           Expanded(
                             child: SizedBox(
                               height: 72,
                               child: ElevatedButton.icon(
-                                onPressed: cameraState.isLoading || cameraState.hasError || isProcessing.value
-                                  ? null 
-                                  : () async {
-                                      isProcessing.value = true;
-                                      scanStatus.value = 'Scanning note...';
-                                      final speechService = ref.read(speechServiceProvider);
-                                      await speechService.speak('Scanning note. Please hold steady.');
-                                      
-                                      try {
-                                        final controller = cameraState.value!;
-                                        final aiService = ref.read(aiServiceProvider);
-                                        String? prediction;
-                                        
-                                        scanStatus.value = 'Analyzing...';
-                                        
-                                        // If streaming, use stream frame. Else take picture.
-                                        if (settings.autoScan) {
-                                          final image = latestImage.value;
-                                          if (image == null) throw Exception('No camera frame ready');
-                                          prediction = await aiService.predictFromCameraImage(image, controller.description.sensorOrientation, settings.confidenceThreshold);
-                                        } else {
-                                          final xFile = await controller.takePicture();
-                                          prediction = await aiService.predict(xFile.path, settings.confidenceThreshold);
-                                        }
-                                        
-                                        if (prediction != null) {
-                                          scanStatus.value = 'Detected: $prediction';
-                                          await speechService.speak('Detected $prediction');
-                                        } else {
-                                          scanStatus.value = 'Could not detect note.';
-                                          await speechService.speak('Could not clearly detect the note.');
-                                        }
-                                      } catch (e) {
-                                        scanStatus.value = 'Scan failed.';
-                                        await speechService.speak('An error occurred during scan.');
-                                      } finally {
-                                        isProcessing.value = false;
-                                      }
-                                  },
-                                icon: const Icon(Icons.document_scanner, size: 28),
+                                onPressed:
+                                    systemBusy || isProcessing.value
+                                        ? null
+                                        : () async {
+                                            if (!isMounted()) return;
+                                            isProcessing.value = true;
+                                            scanStatus.value = 'Scanning note...';
+
+                                            final speechService = ref
+                                                .read(speechServiceProvider);
+                                            await speechService.speak(
+                                              'Scanning note. Please hold steady.',
+                                            );
+
+                                            try {
+                                              final controller =
+                                                  cameraState.value!;
+                                              final aiService =
+                                                  aiState.value!;
+                                              String? prediction;
+
+                                              if (!isMounted()) return;
+                                              scanStatus.value = 'Analysing...';
+
+                                              if (settings.autoScan) {
+                                                // Use the most recent stream frame.
+                                                final image =
+                                                    latestImage.value;
+                                                if (image == null) {
+                                                  throw Exception(
+                                                    'No camera frame ready yet.',
+                                                  );
+                                                }
+                                                prediction = await aiService
+                                                    .predictFromCameraImage(
+                                                  image,
+                                                  controller.description
+                                                      .sensorOrientation,
+                                                  settings.confidenceThreshold,
+                                                );
+                                              } else {
+                                                // Take a still picture.
+                                                final xFile = await controller
+                                                    .takePicture();
+                                                prediction = await aiService
+                                                    .predict(
+                                                  xFile.path,
+                                                  settings.confidenceThreshold,
+                                                );
+                                              }
+
+                                              if (!isMounted()) return;
+                                              if (prediction != null) {
+                                                scanStatus.value =
+                                                    'Detected: $prediction';
+                                                await speechService.speak(
+                                                  'Detected $prediction',
+                                                );
+                                              } else {
+                                                scanStatus.value =
+                                                    'Could not detect note.';
+                                                await speechService.speak(
+                                                  'Could not clearly detect the note. '
+                                                  'Please ensure the note is well lit '
+                                                  'and centred in the camera.',
+                                                );
+                                              }
+                                            } catch (e) {
+                                              if (!isMounted()) return;
+                                              scanStatus.value = 'Scan failed.';
+                                              await ref
+                                                  .read(speechServiceProvider)
+                                                  .speak(
+                                                    'An error occurred during scan.',
+                                                  );
+                                              debugPrint(
+                                                'Manual scan error: $e',
+                                              );
+                                            } finally {
+                                              if (isMounted()) {
+                                                isProcessing.value = false;
+                                              }
+                                            }
+                                          },
+                                icon: const Icon(
+                                  Icons.document_scanner,
+                                  size: 28,
+                                ),
                                 label: const Text('SCAN NOTE'),
                                 style: ElevatedButton.styleFrom(
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
                                 ),
                               ),
                             ),
                           ),
                           const SizedBox(width: 16),
+
+                          // ── GALLERY ──
                           Expanded(
                             child: SizedBox(
                               height: 72,
                               child: ElevatedButton.icon(
-                                onPressed: isProcessing.value ? null : () async {
-                                  final picker = ImagePicker();
-                                  try {
-                                    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
-                                    if (pickedFile != null) {
-                                      isProcessing.value = true;
-                                      scanStatus.value = 'Analyzing image...';
-                                      
-                                      final aiService = ref.read(aiServiceProvider);
-                                      final speechService = ref.read(speechServiceProvider);
-                                      final prediction = await aiService.predict(pickedFile.path, settings.confidenceThreshold);
-                                      
-                                      if (prediction != null) {
-                                        scanStatus.value = 'Detected: $prediction';
-                                        await speechService.speak('Detected $prediction');
-                                      } else {
-                                        scanStatus.value = 'Could not detect note.';
-                                        await speechService.speak('Could not clearly detect the note.');
-                                      }
-                                      isProcessing.value = false;
-                                    }
-                                  } catch (e) {
-                                    scanStatus.value = 'Upload failed.';
-                                    isProcessing.value = false;
-                                  }
-                                },
-                                icon: const Icon(Icons.photo_library, size: 28),
+                                onPressed: isProcessing.value || aiLoading
+                                    ? null
+                                    : () async {
+                                        final picker = ImagePicker();
+                                        try {
+                                          final pickedFile =
+                                              await picker.pickImage(
+                                            source: ImageSource.gallery,
+                                          );
+                                          if (pickedFile == null) return;
+                                          if (!isMounted()) return;
+
+                                          isProcessing.value = true;
+                                          scanStatus.value =
+                                              'Analysing image...';
+
+                                          final aiService = aiState.value!;
+                                          final speechService = ref
+                                              .read(speechServiceProvider);
+
+                                          final prediction = await aiService
+                                              .predict(
+                                            pickedFile.path,
+                                            settings.confidenceThreshold,
+                                          );
+
+                                          if (!isMounted()) return;
+
+                                          if (prediction != null) {
+                                            scanStatus.value =
+                                                'Detected: $prediction';
+                                            await speechService.speak(
+                                              'Detected $prediction',
+                                            );
+                                          } else {
+                                            scanStatus.value =
+                                                'Could not detect note.';
+                                            await speechService.speak(
+                                              'Could not clearly detect the note.',
+                                            );
+                                          }
+                                        } catch (e) {
+                                          if (!isMounted()) return;
+                                          scanStatus.value = 'Upload failed.';
+                                          debugPrint('Gallery error: $e');
+                                        } finally {
+                                          if (isMounted()) {
+                                            isProcessing.value = false;
+                                          }
+                                        }
+                                      },
+                                icon:
+                                    const Icon(Icons.photo_library, size: 28),
                                 label: const Text('GALLERY'),
                                 style: ElevatedButton.styleFrom(
-                                  backgroundColor: theme.colorScheme.secondaryContainer,
-                                  foregroundColor: theme.colorScheme.onSecondaryContainer,
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                                  backgroundColor:
+                                      theme.colorScheme.secondaryContainer,
+                                  foregroundColor:
+                                      theme.colorScheme.onSecondaryContainer,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
                                 ),
                               ),
                             ),
@@ -319,6 +590,61 @@ class CameraScreen extends HookConsumerWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Camera error widget — accessible message with TTS and settings link
+  // ---------------------------------------------------------------------------
+
+  Widget _buildCameraError(
+    BuildContext context,
+    ThemeData theme,
+    Object error,
+    WidgetRef ref,
+  ) {
+    final isPermissionError = error.toString().toLowerCase().contains('permiss');
+
+    // Announce the error via TTS for visually impaired users.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      ref.read(speechServiceProvider).speak(
+            isPermissionError
+                ? 'Camera permission denied. Please grant camera access in Settings.'
+                : 'Camera unavailable. Please restart the application.',
+          );
+    });
+
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              isPermissionError ? Icons.no_photography : Icons.error_outline,
+              size: 64,
+              color: theme.colorScheme.error,
+            ),
+            const SizedBox(height: 16),
+            Text(
+              isPermissionError
+                  ? 'Camera permission denied.\nPlease grant access in Settings.'
+                  : 'Camera unavailable.\n${error.toString()}',
+              style: theme.textTheme.bodyLarge
+                  ?.copyWith(color: theme.colorScheme.error),
+              textAlign: TextAlign.center,
+            ),
+            if (isPermissionError) ...[
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: openAppSettings,
+                icon: const Icon(Icons.settings),
+                label: const Text('Open Settings'),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }

@@ -7,7 +7,9 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 
 # We import the data generator from our previous script
-from 1_data_preprocessing import setup_data_generators, IMAGE_SIZE
+# FIX (M-08): Python module names cannot begin with a digit.
+# Rename '1_data_preprocessing.py' to 'data_preprocessing.py' and update below.
+from data_preprocessing import setup_data_generators, IMAGE_SIZE
 
 def build_model(num_classes):
     # Load MobileNetV2 pre-trained on ImageNet without the top classification layer
