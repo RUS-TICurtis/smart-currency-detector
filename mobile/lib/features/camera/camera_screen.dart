@@ -508,79 +508,7 @@ class CameraScreen extends HookConsumerWidget {
                               ),
                             ),
                           ),
-                          const SizedBox(width: 16),
 
-                          // ── GALLERY ──
-                          Expanded(
-                            child: SizedBox(
-                              height: 72,
-                              child: ElevatedButton.icon(
-                                onPressed: isProcessing.value || aiLoading
-                                    ? null
-                                    : () async {
-                                        final picker = ImagePicker();
-                                        try {
-                                          final pickedFile =
-                                              await picker.pickImage(
-                                            source: ImageSource.gallery,
-                                          );
-                                          if (pickedFile == null) return;
-                                          if (!isMounted()) return;
-
-                                          isProcessing.value = true;
-                                          scanStatus.value =
-                                              'Analysing image...';
-
-                                          final aiService = aiState.value!;
-                                          final speechService = ref
-                                              .read(speechServiceProvider);
-
-                                          final prediction = await aiService
-                                              .predict(
-                                            pickedFile.path,
-                                            settings.confidenceThreshold,
-                                          );
-
-                                          if (!isMounted()) return;
-
-                                          if (prediction != null) {
-                                            scanStatus.value =
-                                                'Detected: $prediction';
-                                            await speechService.speak(
-                                              'Detected $prediction',
-                                            );
-                                          } else {
-                                            scanStatus.value =
-                                                'Could not detect note.';
-                                            await speechService.speak(
-                                              'Could not clearly detect the note.',
-                                            );
-                                          }
-                                        } catch (e) {
-                                          if (!isMounted()) return;
-                                          scanStatus.value = 'Upload failed.';
-                                          debugPrint('Gallery error: $e');
-                                        } finally {
-                                          if (isMounted()) {
-                                            isProcessing.value = false;
-                                          }
-                                        }
-                                      },
-                                icon:
-                                    const Icon(Icons.photo_library, size: 28),
-                                label: const Text('GALLERY'),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor:
-                                      theme.colorScheme.secondaryContainer,
-                                  foregroundColor:
-                                      theme.colorScheme.onSecondaryContainer,
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(20),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ),
                         ],
                       ),
                     ],
