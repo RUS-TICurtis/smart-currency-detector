@@ -5,10 +5,13 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
+import 'package:flutter/foundation.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'providers/camera_provider.dart';
 import 'providers/ai_provider.dart';
+import 'widgets/bounding_box_overlay.dart';
+import '../../../core/services/ai_model_service.dart';
 import '../speech/providers/speech_provider.dart';
 import '../settings/providers/settings_provider.dart';
 
@@ -66,8 +69,13 @@ class CameraScreen extends HookConsumerWidget {
     // Internal refs — mutations don't need to trigger a rebuild.
     final latestImage = useRef<CameraImage?>(null);
     final lastAutoScanTime = useRef<DateTime>(DateTime.now());
-    // FIX (C-04): sliding window for majority-vote consensus (max 5 entries).
-    final detectionHistory = useRef<List<String>>([]);
+    
+    // Aggregation history for multi-note detection.
+    final detectionHistory = useRef<List<Map<String, int>>>([]);
+    final lastSpokenText = useRef<String>('');
+    
+    // Notifier to instantly update the bounding box overlay without full rebuilds.
+    final currentDetections = useValueNotifier<List<RecognizedObject>>([]);
 
     // Update status when model/camera become ready
     useEffect(() {
@@ -150,10 +158,10 @@ class CameraScreen extends HookConsumerWidget {
             if (isProcessing.value) return;
 
             final now = DateTime.now();
-            // FIX (M-02): reduced debounce from 2 s → 800 ms for faster
-            // consensus convergence (3 votes × 800 ms = min 2.4 s to confirm).
+            // Reduced debounce from 800ms -> 200ms to allow smoother bounding box updates.
+            // isProcessing acts as backpressure so frames aren't queued up.
             if (now.difference(lastAutoScanTime.value) <
-                const Duration(milliseconds: 800)) {
+                const Duration(milliseconds: 200)) {
               return;
             }
             lastAutoScanTime.value = now;
@@ -171,38 +179,59 @@ class CameraScreen extends HookConsumerWidget {
 
               final history = detectionHistory.value;
 
-              if (prediction != null) {
-                // ── FIX (C-04): Majority-vote sliding window ──
-                // Add to window and cap at 5 entries.
-                history.add(prediction);
+              if (prediction != null && prediction.isNotEmpty) {
+                currentDetections.value = prediction;
+
+                // ── 1. Parse labels and aggregate counts ──
+                final Map<String, int> counts = {};
+                double totalValue = 0;
+                for (final p in prediction) {
+                  counts[p.label] = (counts[p.label] ?? 0) + 1;
+                  final match = RegExp(r'\d+').firstMatch(p.label);
+                  if (match != null) {
+                    totalValue += double.parse(match.group(0)!);
+                  }
+                }
+
+                // ── 2. Sliding window consensus ──
+                history.add(counts);
                 if (history.length > 5) history.removeAt(0);
 
-                // Count votes for each label in the window.
-                final counts = <String, int>{};
-                for (final p in history) {
-                  counts[p] = (counts[p] ?? 0) + 1;
+                bool isStable = history.length == 5;
+                if (isStable) {
+                  for (int i = 1; i < history.length; i++) {
+                    if (!mapEquals(history[0], history[i])) {
+                      isStable = false;
+                      break;
+                    }
+                  }
                 }
 
-                // Find the label with the most votes.
-                final best = counts.entries
-                    .reduce((a, b) => a.value >= b.value ? a : b);
+                // ── 3. Announce if stable and changed ──
+                if (isStable) {
+                  final parts = <String>[];
+                  counts.forEach((label, count) {
+                    parts.add('$count $label note${count > 1 ? 's' : ''}');
+                  });
+                  final summary = '${parts.join(', ')}. Total value: ${totalValue.toInt()} Ghana Cedis.';
 
-                if (best.value >= 3) {
-                  // Majority reached — announce and reset the window.
-                  scanStatus.value = 'Detected: ${best.key}';
-                  ref
-                      .read(speechServiceProvider)
-                      .speak('Detected ${best.key}');
-                  history.clear();
+                  scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toInt()}';
+                  
+                  if (lastSpokenText.value != summary) {
+                    ref.read(speechServiceProvider).speak(summary);
+                    lastSpokenText.value = summary;
+                  }
                 } else {
-                  scanStatus.value =
-                      'Verifying... (${history.length}/5)';
+                  scanStatus.value = 'Verifying... (${history.length}/5)';
                 }
               } else {
-                // No detection: age out the oldest entry so the window stays
-                // fresh but doesn't immediately discard valid prior detections.
+                currentDetections.value = [];
+                // No detection: age out the oldest entry
                 if (history.isNotEmpty) history.removeAt(0);
-                if (history.isEmpty) scanStatus.value = 'Scanning...';
+                if (history.isEmpty) {
+                  scanStatus.value = 'Scanning...';
+                  lastSpokenText.value = ''; // Reset so we announce again when notes return
+                }
               }
 
               isProcessing.value = false;
@@ -248,9 +277,23 @@ class CameraScreen extends HookConsumerWidget {
           // ── 1. Full-screen camera preview ──
           Positioned.fill(
             child: cameraState.when(
-              data: (controller) => Container(
-                color: Colors.black,
-                child: Center(child: CameraPreview(controller)),
+              data: (controller) => Stack(
+                fit: StackFit.expand,
+                children: [
+                  Container(
+                    color: Colors.black,
+                    child: Center(child: CameraPreview(controller)),
+                  ),
+                  ValueListenableBuilder<List<RecognizedObject>>(
+                    valueListenable: currentDetections,
+                    builder: (context, detections, _) {
+                      return BoundingBoxOverlay(
+                        cameraController: controller,
+                        detections: detections,
+                      );
+                    },
+                  ),
+                ],
               ),
               error: (error, _) => _buildCameraError(
                 context,
@@ -430,7 +473,7 @@ class CameraScreen extends HookConsumerWidget {
                                                   cameraState.value!;
                                               final aiService =
                                                   aiState.value!;
-                                              String? prediction;
+                                              List<RecognizedObject>? prediction;
 
                                               if (!isMounted()) return;
                                               scanStatus.value = 'Analysing...';
@@ -463,12 +506,25 @@ class CameraScreen extends HookConsumerWidget {
                                               }
 
                                               if (!isMounted()) return;
-                                              if (prediction != null) {
-                                                scanStatus.value =
-                                                    'Detected: $prediction';
-                                                await speechService.speak(
-                                                  'Detected $prediction',
-                                                );
+                                              if (prediction != null && prediction.isNotEmpty) {
+                                                final Map<String, int> counts = {};
+                                                double totalValue = 0;
+                                                for (final p in prediction) {
+                                                  counts[p.label] = (counts[p.label] ?? 0) + 1;
+                                                  final match = RegExp(r'\d+').firstMatch(p.label);
+                                                  if (match != null) {
+                                                    totalValue += double.parse(match.group(0)!);
+                                                  }
+                                                }
+
+                                                final parts = <String>[];
+                                                counts.forEach((label, count) {
+                                                  parts.add('$count $label note${count > 1 ? 's' : ''}');
+                                                });
+                                                final summary = '${parts.join(', ')}. Total value: ${totalValue.toInt()} Ghana Cedis.';
+
+                                                scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toInt()}';
+                                                await speechService.speak(summary);
                                               } else {
                                                 scanStatus.value =
                                                     'Could not detect note.';

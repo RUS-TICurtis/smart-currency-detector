@@ -41,14 +41,16 @@ class IsolatePlane {
 // Internal detection result (used during NMS)
 // ---------------------------------------------------------------------------
 
-class _Detection {
+class RecognizedObject {
   final int classIndex;
+  final String label;
   final double confidence;
   // Bounding-box corners in pixel space (0..inputSize).
   final double x1, y1, x2, y2;
 
-  const _Detection(
+  const RecognizedObject(
     this.classIndex,
+    this.label,
     this.confidence,
     this.x1,
     this.y1,
@@ -140,7 +142,7 @@ class AIModelService {
   // ---------------------------------------------------------------------------
 
   /// Run inference on a still image at [imagePath] (gallery / takePicture).
-  Future<String?> predict(String imagePath, double confidenceThreshold) async {
+  Future<List<RecognizedObject>?> predict(String imagePath, double confidenceThreshold) async {
     if (!_isReady) return null;
     try {
       // Preprocessing is CPU-heavy — offload to a background isolate.
@@ -157,7 +159,7 @@ class AIModelService {
   }
 
   /// Run inference on a live [CameraImage] frame from the camera stream.
-  Future<String?> predictFromCameraImage(
+  Future<List<RecognizedObject>?> predictFromCameraImage(
     CameraImage image,
     int sensorOrientation,
     double confidenceThreshold,
@@ -197,9 +199,8 @@ class AIModelService {
   // Inference core (runs on main isolate — interpreter lives here)
   // ---------------------------------------------------------------------------
 
-  /// FIX (C-01 / H-09): Parse the raw YOLOv11 output with proper NMS instead
-  /// of naively picking the single highest-confidence anchor.
-  String? _runInference(Float32List flatInput, double confidenceThreshold) {
+  /// Returns a list of all detected objects after NMS.
+  List<RecognizedObject>? _runInference(Float32List flatInput, double confidenceThreshold) {
     // ── Reshape 1D flat buffer to 4D nested list [1, 3, 640, 640] ──
     // We transfer a flat Float32List across isolates for speed, but tflite_flutter
     // expects a nested list matching the tensor shape, otherwise it resizes the
@@ -222,7 +223,7 @@ class AIModelService {
     _interpreter!.run(input4D, output);
 
     // ── 1. Parse raw anchors into candidate detections ──
-    final detections = <_Detection>[];
+    final detections = <RecognizedObject>[];
 
     for (int a = 0; a < numAnchors; a++) {
       double maxScore = 0.0;
@@ -247,8 +248,9 @@ class AIModelService {
       final h = output[0][3][a];
 
       detections.add(
-        _Detection(
+        RecognizedObject(
           bestClass,
+          _labels![bestClass],
           maxScore,
           cx - w / 2, // x1
           cy - h / 2, // y1
@@ -264,29 +266,24 @@ class AIModelService {
     final kept = _applyNMS(detections, _nmsIouThreshold);
     if (kept.isEmpty) return null;
 
-    // ── 3. Return the label of the highest-confidence surviving detection ──
+    // ── 3. Return all surviving detections ──
     kept.sort((a, b) => b.confidence.compareTo(a.confidence));
-    final winner = kept.first;
-    debugPrint(
-      'AIModelService: detected "${_labels![winner.classIndex]}" '
-      '(confidence ${winner.confidence.toStringAsFixed(3)})',
-    );
-    return _labels![winner.classIndex];
+    return kept;
   }
 
   // ---------------------------------------------------------------------------
   // Non-Maximum Suppression
   // ---------------------------------------------------------------------------
 
-  static List<_Detection> _applyNMS(
-    List<_Detection> detections,
+  static List<RecognizedObject> _applyNMS(
+    List<RecognizedObject> detections,
     double iouThreshold,
   ) {
     // Sort descending by confidence so higher-quality boxes win.
     detections.sort((a, b) => b.confidence.compareTo(a.confidence));
 
     final suppressed = List<bool>.filled(detections.length, false);
-    final kept = <_Detection>[];
+    final kept = <RecognizedObject>[];
 
     for (int i = 0; i < detections.length; i++) {
       if (suppressed[i]) continue;
@@ -301,7 +298,7 @@ class AIModelService {
     return kept;
   }
 
-  static double _iou(_Detection a, _Detection b) {
+  static double _iou(RecognizedObject a, RecognizedObject b) {
     final interX1 = max(a.x1, b.x1);
     final interY1 = max(a.y1, b.y1);
     final interX2 = min(a.x2, b.x2);
