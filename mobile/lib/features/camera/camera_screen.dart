@@ -13,6 +13,7 @@ import 'widgets/bounding_box_overlay.dart';
 import '../../../core/services/ai_model_service.dart';
 import '../speech/providers/speech_provider.dart';
 import '../settings/providers/settings_provider.dart';
+import 'package:haptic_feedback/haptic_feedback.dart';
 
 // ---------------------------------------------------------------------------
 // Lifecycle observer — pauses the camera stream and torch when the OS
@@ -125,6 +126,10 @@ class CameraScreen extends HookConsumerWidget {
             controller.setFlashMode(FlashMode.off).catchError((_) {});
             if (isMounted()) isFlashOn.value = false;
           }
+          
+          // FIX: Invalidate provider to fully release camera hardware so it
+          // doesn't crash upon returning from background.
+          ref.invalidate(cameraControllerProvider);
         },
         onResume: () {
           // The autoScan effect (Effect 3) will restart the stream if needed.
@@ -178,59 +183,71 @@ class CameraScreen extends HookConsumerWidget {
 
               final history = detectionHistory.value;
 
+              final Map<String, int> counts = {};
               if (prediction != null && prediction.isNotEmpty) {
                 currentDetections.value = prediction;
-
-                // ── 1. Parse labels and aggregate counts ──
-                final Map<String, int> counts = {};
-                double totalValue = 0;
                 for (final p in prediction) {
                   counts[p.label] = (counts[p.label] ?? 0) + 1;
-                  final match = RegExp(r'\d+').firstMatch(p.label);
-                  if (match != null) {
-                    totalValue += double.parse(match.group(0)!);
-                  }
+                }
+              } else {
+                currentDetections.value = [];
+              }
+
+              // ── 2. Sliding window Median Consensus ──
+              history.add(counts);
+              if (history.length > 5) history.removeAt(0);
+
+              // Wait until we have a full window (5 frames) for a stable read
+              if (history.length == 5) {
+                final Map<String, int> stableCounts = {};
+                final Set<String> allLabels = {};
+                for (final map in history) {
+                  allLabels.addAll(map.keys);
                 }
 
-                // ── 2. Sliding window consensus ──
-                history.add(counts);
-                if (history.length > 5) history.removeAt(0);
+                double stableTotalValue = 0;
 
-                bool isStable = history.length == 5;
-                if (isStable) {
-                  for (int i = 1; i < history.length; i++) {
-                    if (!mapEquals(history[0], history[i])) {
-                      isStable = false;
-                      break;
+                for (final label in allLabels) {
+                  // Extract counts for this label across all 5 frames
+                  final labelCounts = history.map((m) => m[label] ?? 0).toList();
+                  labelCounts.sort();
+                  final median = labelCounts[2]; // middle element of 5
+                  
+                  if (median > 0) {
+                    stableCounts[label] = median;
+                    final match = RegExp(r'\d+').firstMatch(label);
+                    if (match != null) {
+                      stableTotalValue += double.parse(match.group(0)!) * median;
                     }
                   }
                 }
 
-                // ── 3. Announce if stable and changed ──
-                if (isStable) {
+                // ── 3. Announce if changed ──
+                if (stableCounts.isNotEmpty) {
                   final parts = <String>[];
-                  counts.forEach((label, count) {
+                  stableCounts.forEach((label, count) {
                     parts.add('$count $label note${count > 1 ? 's' : ''}');
                   });
-                  final summary = '${parts.join(', ')}. Total value: ${totalValue.toInt()} Ghana Cedis.';
+                  final summary = '${parts.join(', ')}. Total value: ${stableTotalValue.toInt()} Ghana Cedis.';
 
-                  scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toInt()}';
+                  scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${stableTotalValue.toInt()}';
                   
                   if (lastSpokenText.value != summary) {
+                    Haptics.vibrate(HapticsType.success);
                     ref.read(speechServiceProvider).speak(summary);
                     lastSpokenText.value = summary;
                   }
                 } else {
-                  scanStatus.value = 'Verifying... (${history.length}/5)';
+                  scanStatus.value = 'Could not detect note';
+                  final summary = 'Could not detect note';
+                  // Speak it if we just lost the notes, preventing looping spam
+                  if (lastSpokenText.value != summary && lastSpokenText.value != '') {
+                    ref.read(speechServiceProvider).speak(summary);
+                    lastSpokenText.value = summary;
+                  }
                 }
               } else {
-                currentDetections.value = [];
-                // No detection: age out the oldest entry
-                if (history.isNotEmpty) history.removeAt(0);
-                if (history.isEmpty) {
-                  scanStatus.value = 'Scanning...';
-                  lastSpokenText.value = ''; // Reset so we announce again when notes return
-                }
+                scanStatus.value = 'Verifying... (${history.length}/5)';
               }
 
               isProcessing.value = false;
@@ -280,17 +297,21 @@ class CameraScreen extends HookConsumerWidget {
                 fit: StackFit.expand,
                 children: [
                   Container(
+                    width: double.infinity,
+                    height: double.infinity,
                     color: Colors.black,
-                    child: Center(child: CameraPreview(controller)),
+                    child: Center(child: RepaintBoundary(child: CameraPreview(controller))),
                   ),
-                  ValueListenableBuilder<List<RecognizedObject>>(
-                    valueListenable: currentDetections,
-                    builder: (context, detections, _) {
-                      return BoundingBoxOverlay(
-                        cameraController: controller,
-                        detections: detections,
-                      );
-                    },
+                  RepaintBoundary(
+                    child: ValueListenableBuilder<List<RecognizedObject>>(
+                      valueListenable: currentDetections,
+                      builder: (context, detections, _) {
+                        return BoundingBoxOverlay(
+                          cameraController: controller,
+                          detections: detections,
+                        );
+                      },
+                    ),
                   ),
                 ],
               ),
@@ -323,16 +344,20 @@ class CameraScreen extends HookConsumerWidget {
             child: Column(
               children: [
                 // Settings
-                Container(
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.4),
-                    shape: BoxShape.circle,
-                  ),
-                  child: IconButton(
-                    icon: const Icon(Icons.settings, color: Colors.white),
-                    tooltip: 'Settings',
-                    iconSize: 28,
-                    onPressed: () => context.push('/settings'),
+                Semantics(
+                  button: true,
+                  label: 'Settings',
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.4),
+                      shape: BoxShape.circle,
+                    ),
+                    child: IconButton(
+                      icon: const Icon(Icons.settings, color: Colors.white),
+                      tooltip: 'Settings',
+                      iconSize: 28,
+                      onPressed: () => context.push('/settings'),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -341,34 +366,38 @@ class CameraScreen extends HookConsumerWidget {
                 if (cameraState.hasValue &&
                     !cameraState.isLoading &&
                     !cameraState.hasError)
-                  Container(
-                    decoration: BoxDecoration(
-                      color: isFlashOn.value
-                          ? theme.colorScheme.primary
-                          : Colors.black.withValues(alpha: 0.4),
-                      shape: BoxShape.circle,
-                    ),
-                    child: IconButton(
-                      icon: Icon(
-                        isFlashOn.value ? Icons.flash_on : Icons.flash_off,
+                  Semantics(
+                    button: true,
+                    label: isFlashOn.value ? 'Turn off flashlight' : 'Turn on flashlight',
+                    child: Container(
+                      decoration: BoxDecoration(
                         color: isFlashOn.value
-                            ? theme.colorScheme.onPrimary
-                            : Colors.white,
+                            ? theme.colorScheme.primary
+                            : Colors.black.withValues(alpha: 0.4),
+                        shape: BoxShape.circle,
                       ),
-                      tooltip: 'Toggle Flashlight',
-                      iconSize: 28,
-                      onPressed: () async {
-                        final controller = cameraState.value!;
-                        try {
-                          final newMode = isFlashOn.value
-                              ? FlashMode.off
-                              : FlashMode.torch;
-                          await controller.setFlashMode(newMode);
-                          if (isMounted()) isFlashOn.value = !isFlashOn.value;
-                        } catch (e) {
-                          debugPrint('Failed to toggle flash: $e');
-                        }
-                      },
+                      child: IconButton(
+                        icon: Icon(
+                          isFlashOn.value ? Icons.flash_on : Icons.flash_off,
+                          color: isFlashOn.value
+                              ? theme.colorScheme.onPrimary
+                              : Colors.white,
+                        ),
+                        tooltip: 'Toggle Flashlight',
+                        iconSize: 28,
+                        onPressed: () async {
+                          final controller = cameraState.value!;
+                          try {
+                            final newMode = isFlashOn.value
+                                ? FlashMode.off
+                                : FlashMode.torch;
+                            await controller.setFlashMode(newMode);
+                            if (isMounted()) isFlashOn.value = !isFlashOn.value;
+                          } catch (e) {
+                            debugPrint('Failed to toggle flash: $e');
+                          }
+                        },
+                      ),
                     ),
                   ),
               ],

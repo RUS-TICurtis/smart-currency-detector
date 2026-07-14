@@ -263,7 +263,7 @@ class AIModelService {
     if (detections.isEmpty) return null;
 
     // ── 2. Apply Non-Maximum Suppression ──
-    final kept = _applyNMS(detections, _nmsIouThreshold);
+    final kept = applyNMS(detections, _nmsIouThreshold);
     if (kept.isEmpty) return null;
 
     // ── 3. Return all surviving detections ──
@@ -275,7 +275,8 @@ class AIModelService {
   // Non-Maximum Suppression
   // ---------------------------------------------------------------------------
 
-  static List<RecognizedObject> _applyNMS(
+  @visibleForTesting
+  static List<RecognizedObject> applyNMS(
     List<RecognizedObject> detections,
     double iouThreshold,
   ) {
@@ -290,7 +291,7 @@ class AIModelService {
       kept.add(detections[i]);
       for (int j = i + 1; j < detections.length; j++) {
         if (suppressed[j]) continue;
-        if (_iou(detections[i], detections[j]) > iouThreshold) {
+        if (iou(detections[i], detections[j]) > iouThreshold) {
           suppressed[j] = true;
         }
       }
@@ -298,7 +299,8 @@ class AIModelService {
     return kept;
   }
 
-  static double _iou(RecognizedObject a, RecognizedObject b) {
+  @visibleForTesting
+  static double iou(RecognizedObject a, RecognizedObject b) {
     final interX1 = max(a.x1, b.x1);
     final interY1 = max(a.y1, b.y1);
     final interX2 = min(a.x2, b.x2);
@@ -365,9 +367,7 @@ class AIModelService {
     try {
       img.Image? image;
 
-      if (data.formatGroup == 'yuv420') {
-        image = _decodeYUV420(data);
-      } else if (data.formatGroup == 'bgra8888') {
+      if (data.formatGroup == 'bgra8888') {
         image = img.Image.fromBytes(
           width: data.width,
           height: data.height,
@@ -376,10 +376,11 @@ class AIModelService {
         );
       } else {
         debugPrint(
-          'AIModelService: unsupported camera format "${data.formatGroup}"',
+          'AIModelService: unsupported camera format "${data.formatGroup}". Expected bgra8888.',
         );
         return null;
       }
+      
       // Correct sensor rotation before resizing.
       if (data.sensorOrientation != 0) {
         image = img.copyRotate(image, angle: data.sensorOrientation);
@@ -389,47 +390,6 @@ class AIModelService {
     } catch (e) {
       return null;
     }
-  }
-
-  /// FIX (C-05): Decode YUV420 camera planes to RGB.
-  /// Uses the actual [IsolatePlane.bytesPerPixel] (defaulted to 2 for Android
-  /// NV12/NV21) instead of a hard-coded 1, preventing UV colour distortion.
-  static img.Image _decodeYUV420(IsolateCameraImage data) {
-    final output = img.Image(width: data.width, height: data.height);
-
-    final yPlane = data.planes[0];
-    final uPlane = data.planes[1];
-    final vPlane = data.planes[2];
-
-    final uPixelStride = uPlane.bytesPerPixel; // 2 for NV12/NV21 (interleaved)
-    final vPixelStride = vPlane.bytesPerPixel;
-
-    for (int h = 0; h < data.height; h++) {
-      for (int w = 0; w < data.width; w++) {
-        final yIndex = h * yPlane.bytesPerRow + w;
-        final uIndex = (h ~/ 2) * uPlane.bytesPerRow + (w ~/ 2) * uPixelStride;
-        final vIndex = (h ~/ 2) * vPlane.bytesPerRow + (w ~/ 2) * vPixelStride;
-
-        // Bounds guard — some devices have non-standard row padding.
-        if (yIndex >= yPlane.bytes.length) continue;
-        if (uIndex >= uPlane.bytes.length) continue;
-        if (vIndex >= vPlane.bytes.length) continue;
-
-        final yVal = yPlane.bytes[yIndex].toDouble();
-        final uVal = uPlane.bytes[uIndex].toDouble() - 128.0;
-        final vVal = vPlane.bytes[vIndex].toDouble() - 128.0;
-
-        final r = (yVal + 1.402 * vVal).round().clamp(0, 255);
-        final g = (yVal - 0.344136 * uVal - 0.714136 * vVal).round().clamp(
-          0,
-          255,
-        );
-        final b = (yVal + 1.772 * uVal).round().clamp(0, 255);
-
-        output.setPixelRgb(w, h, r, g, b);
-      }
-    }
-    return output;
   }
 
   /// Aspect-ratio-preserving resize + centre letterbox to inputSize x inputSize.

@@ -38,9 +38,9 @@ final cameraControllerProvider =
     // and halves the preprocessing cost vs. ResolutionPreset.high.
     ResolutionPreset.medium,
     enableAudio: false,
-    // FIX (H-07): Explicitly declare the format so the preprocessing branch
-    // selection in AIModelService never falls through to the null-return path.
-    imageFormatGroup: ImageFormatGroup.yuv420,
+    // FIX (H-07): Explicitly declare the format to bgra8888 so the preprocessing
+    // skips manual YUV decoding in AIModelService.
+    imageFormatGroup: ImageFormatGroup.bgra8888,
   );
 
   await controller.initialize();
