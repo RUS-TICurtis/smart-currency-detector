@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:smart_currency_app/main.dart';
+import 'package:cedi_cam/main.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 void main() {
@@ -10,7 +10,7 @@ void main() {
   });
 
   testWidgets('App smoke test', (WidgetTester tester) async {
-    await tester.pumpWidget(const ProviderScope(child: SmartCurrencyApp()));
+    await tester.pumpWidget(const ProviderScope(child: CediCamApp()));
     
     // We expect the GoRouter to navigate to the CameraScreen
     await tester.pumpAndSettle();

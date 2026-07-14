@@ -28,20 +28,20 @@ void main() async {
   runApp(
     // ProviderScope holds the state of all Riverpod providers.
     const ProviderScope(
-      child: SmartCurrencyApp(),
+      child: CediCamApp(),
     ),
   );
 }
 
-class SmartCurrencyApp extends ConsumerWidget {
-  const SmartCurrencyApp({super.key});
+class CediCamApp extends ConsumerWidget {
+  const CediCamApp({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final goRouter = ref.watch(routerProvider);
 
     return MaterialApp.router(
-      title: 'Smart Currency Detector',
+      title: 'Cedi Cam',
       theme: AppTheme.lightTheme,
       darkTheme: AppTheme.darkTheme,
       themeMode: ThemeMode.system,
