@@ -11,10 +11,14 @@ import 'providers/camera_provider.dart';
 import 'providers/ai_provider.dart';
 import 'widgets/bounding_box_overlay.dart';
 import '../../../core/services/ai_model_service.dart';
+import '../../../core/models/ghana_cedi_denomination.dart';
+import '../../../core/services/currency_validator.dart';
 import '../speech/providers/speech_provider.dart';
 import '../settings/providers/settings_provider.dart';
+import '../detection/providers/session_provider.dart';
+import '../detection/widgets/summation_bottom_sheet.dart';
 import 'package:haptic_feedback/haptic_feedback.dart';
-
+ 
 // ---------------------------------------------------------------------------
 // Lifecycle observer — pauses the camera stream and torch when the OS
 // backgrounds the app, then lets the autoScan effect resume them.
@@ -50,11 +54,13 @@ class CameraScreen extends HookConsumerWidget {
     final cameraState = ref.watch(cameraControllerProvider);
     final aiState = ref.watch(aiServiceProvider); // FutureProvider<AIModelService>
     final settings = ref.watch(settingsProvider);
+    final sessionState = ref.watch(sessionProvider);
 
     // ── Local state ──
     final scanStatus = useState('Loading model...');
     final isProcessing = useState(false);
     final isFlashOn = useState(false);
+    final appResumedTick = useState(0);
 
     // FIX (H-04): Track mount state via a ValueNotifier so async callbacks
     // can safely check before calling setState on a disposed widget.
@@ -71,7 +77,7 @@ class CameraScreen extends HookConsumerWidget {
     final lastAutoScanTime = useRef<DateTime>(DateTime.now());
     
     // Aggregation history for multi-note detection.
-    final detectionHistory = useRef<List<Map<String, int>>>([]);
+    final detectionHistory = useRef<List<Map<GhanaCedi, int>>>([]);
     final lastSpokenText = useRef<String>('');
     
     // Notifier to instantly update the bounding box overlay without full rebuilds.
@@ -127,13 +133,13 @@ class CameraScreen extends HookConsumerWidget {
             if (isMounted()) isFlashOn.value = false;
           }
           
-          // FIX: Invalidate provider to fully release camera hardware so it
-          // doesn't crash upon returning from background.
-          ref.invalidate(cameraControllerProvider);
+          // Stop stream and torch, but DO NOT invalidate provider.
+          // Native camera plugin can resume itself, provider rebuild causes jank.
         },
         onResume: () {
           // The autoScan effect (Effect 3) will restart the stream if needed.
           debugPrint('CameraScreen: app resumed.');
+          if (isMounted()) appResumedTick.value++;
         },
       );
 
@@ -183,12 +189,12 @@ class CameraScreen extends HookConsumerWidget {
 
               final history = detectionHistory.value;
 
-              final Map<String, int> counts = {};
+              final Map<GhanaCedi, int> counts = prediction != null && prediction.isNotEmpty
+                  ? CurrencyValidator.validateAndCapDetections(prediction)
+                  : {};
+
               if (prediction != null && prediction.isNotEmpty) {
                 currentDetections.value = prediction;
-                for (final p in prediction) {
-                  counts[p.label] = (counts[p.label] ?? 0) + 1;
-                }
               } else {
                 currentDetections.value = [];
               }
@@ -199,52 +205,44 @@ class CameraScreen extends HookConsumerWidget {
 
               // Wait until we have a full window (5 frames) for a stable read
               if (history.length == 5) {
-                final Map<String, int> stableCounts = {};
-                final Set<String> allLabels = {};
+                final Map<GhanaCedi, int> stableCounts = {};
+                final Set<GhanaCedi> allLabels = {};
                 for (final map in history) {
                   allLabels.addAll(map.keys);
                 }
 
-                double stableTotalValue = 0;
-
-                for (final label in allLabels) {
+                for (final denomination in allLabels) {
                   // Extract counts for this label across all 5 frames
-                  final labelCounts = history.map((m) => m[label] ?? 0).toList();
+                  final labelCounts = history.map((m) => m[denomination] ?? 0).toList();
                   labelCounts.sort();
                   final median = labelCounts[2]; // middle element of 5
                   
                   if (median > 0) {
-                    stableCounts[label] = median;
-                    final match = RegExp(r'\d+').firstMatch(label);
-                    if (match != null) {
-                      stableTotalValue += double.parse(match.group(0)!) * median;
-                    }
+                    stableCounts[denomination] = median;
                   }
                 }
 
-                // ── 3. Announce if changed ──
+                // ── 3. Process with SessionProvider ──
                 if (stableCounts.isNotEmpty) {
-                  final parts = <String>[];
-                  stableCounts.forEach((label, count) {
-                    parts.add('$count $label note${count > 1 ? 's' : ''}');
-                  });
-                  final summary = '${parts.join(', ')}. Total value: ${stableTotalValue.toInt()} Ghana Cedis.';
-
-                  scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${stableTotalValue.toInt()}';
+                  final addedValue = ref.read(sessionProvider.notifier).processDetection(stableCounts);
                   
-                  if (lastSpokenText.value != summary) {
+                  if (addedValue > 0) {
                     Haptics.vibrate(HapticsType.success);
+                    final total = ref.read(sessionProvider).totalValue;
+                    final summary = 'Added ${addedValue.toStringAsFixed(0)} Cedis. Total is now ${total.toStringAsFixed(0)} Cedis.';
                     ref.read(speechServiceProvider).speak(summary);
+                    scanStatus.value = 'Added GHS ${addedValue.toStringAsFixed(2)}\nTotal: GHS ${total.toStringAsFixed(2)}';
                     lastSpokenText.value = summary;
+                  } else {
+                    // It's stable but ignored due to cooldown.
+                    if (scanStatus.value != 'Note already scanned') {
+                       Haptics.vibrate(HapticsType.light);
+                       scanStatus.value = 'Note already scanned';
+                    }
                   }
                 } else {
                   scanStatus.value = 'Could not detect note';
-                  final summary = 'Could not detect note';
-                  // Speak it if we just lost the notes, preventing looping spam
-                  if (lastSpokenText.value != summary && lastSpokenText.value != '') {
-                    ref.read(speechServiceProvider).speak(summary);
-                    lastSpokenText.value = summary;
-                  }
+                  ref.read(sessionProvider.notifier).resetScannerTracking();
                 }
               } else {
                 scanStatus.value = 'Verifying... (${history.length}/5)';
@@ -277,6 +275,7 @@ class CameraScreen extends HookConsumerWidget {
       aiState.hasValue,
       settings.autoScan,
       settings.confidenceThreshold,
+      appResumedTick.value,
     ]);
 
     // ── Convenience booleans for the UI ──
@@ -343,6 +342,25 @@ class CameraScreen extends HookConsumerWidget {
             right: 16,
             child: Column(
               children: [
+                // History
+                Semantics(
+                  button: true,
+                  label: 'History',
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.4),
+                      shape: BoxShape.circle,
+                    ),
+                    child: IconButton(
+                      icon: const Icon(Icons.history, color: Colors.white),
+                      tooltip: 'History',
+                      iconSize: 28,
+                      onPressed: () => context.push('/history'),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+
                 // Settings
                 Semantics(
                   button: true,
@@ -477,6 +495,36 @@ class CameraScreen extends HookConsumerWidget {
                       // Action buttons
                       Row(
                         children: [
+                          // ── SUMMATION BUTTON ──
+                          Expanded(
+                            child: SizedBox(
+                              height: 72,
+                              child: ElevatedButton.icon(
+                                onPressed: () {
+                                  showModalBottomSheet(
+                                    context: context,
+                                    isScrollControlled: true,
+                                    backgroundColor: Colors.transparent,
+                                    builder: (context) => const SummationBottomSheet(),
+                                  );
+                                },
+                                icon: const Icon(Icons.receipt_long, size: 28),
+                                label: Text(
+                                  'GHS ${sessionState.totalValue.toStringAsFixed(2)}',
+                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                                ),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: theme.colorScheme.primaryContainer,
+                                  foregroundColor: theme.colorScheme.onPrimaryContainer,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+
                           // ── SCAN NOTE ──
                           Expanded(
                             child: SizedBox(
@@ -535,24 +583,26 @@ class CameraScreen extends HookConsumerWidget {
 
                                               if (!isMounted()) return;
                                               if (prediction != null && prediction.isNotEmpty) {
-                                                final Map<String, int> counts = {};
-                                                double totalValue = 0;
-                                                for (final p in prediction) {
-                                                  counts[p.label] = (counts[p.label] ?? 0) + 1;
-                                                  final match = RegExp(r'\d+').firstMatch(p.label);
-                                                  if (match != null) {
-                                                    totalValue += double.parse(match.group(0)!);
-                                                  }
+                                                final validatedCounts = CurrencyValidator.validateAndCapDetections(prediction);
+                                                
+                                                if (validatedCounts.isNotEmpty) {
+                                                  double totalValue = 0;
+                                                  final parts = <String>[];
+                                                  
+                                                  validatedCounts.forEach((denomination, count) {
+                                                    totalValue += denomination.value * count;
+                                                    parts.add('$count, ${denomination.displayName} note${count > 1 ? 's' : ''}');
+                                                  });
+                                                  
+                                                  final summary = '${parts.join(', ')}. Total value: ${totalValue.toStringAsFixed(2)} Ghana Cedis.';
+
+                                                  scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toStringAsFixed(2)}';
+                                                  await speechService.speak(summary);
+                                                } else {
+                                                  // All bounding boxes were rejected by validator
+                                                  scanStatus.value = 'Could not detect valid note.';
+                                                  await speechService.speak('Could not clearly detect a valid note.');
                                                 }
-
-                                                final parts = <String>[];
-                                                counts.forEach((label, count) {
-                                                  parts.add('$count $label note${count > 1 ? 's' : ''}');
-                                                });
-                                                final summary = '${parts.join(', ')}. Total value: ${totalValue.toInt()} Ghana Cedis.';
-
-                                                scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toInt()}';
-                                                await speechService.speak(summary);
                                               } else {
                                                 scanStatus.value =
                                                     'Could not detect note.';

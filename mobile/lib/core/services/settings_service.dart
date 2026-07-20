@@ -21,7 +21,7 @@ class SettingsService {
   static const double defaultSpeechVolume = 1.0;
   static const bool defaultAutoScan = false;
   static const double defaultCameraZoom = 1.0;
-  static const double defaultConfidenceThreshold = 0.50;
+  static const double defaultConfidenceThreshold = 0.70;
 
   // ── Speech rate ──
   double get speechRate =>

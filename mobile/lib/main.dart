@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 import 'core/constants/app_theme.dart';
+import 'core/services/history_repository.dart';
 import 'routes/app_router.dart';
 
 void main() async {
@@ -24,6 +25,7 @@ void main() async {
   // Initialise local storage before launching the app.
   await Hive.initFlutter();
   await Hive.openBox('settings');
+  await HistoryRepository.init();
 
   runApp(
     // ProviderScope holds the state of all Riverpod providers.

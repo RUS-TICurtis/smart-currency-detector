@@ -5,6 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
+import 'dart:typed_data';
 import 'package:image/image.dart' as img;
 
 // ---------------------------------------------------------------------------
@@ -67,7 +68,7 @@ class AIModelService {
   Interpreter? _interpreter;
   List<String>? _labels;
 
-  static const String _modelPath = 'assets/model/best.tflite';
+  static const String _modelPath = 'assets/model/best_int8.tflite';
   static const String _labelPath = 'assets/model/labels.txt';
 
   /// Input spatial dimension expected by the YOLOv11 model (640 × 640).
@@ -77,9 +78,21 @@ class AIModelService {
   static const double _letterboxFill = 114.0 / 255.0;
 
   /// IoU threshold for Non-Maximum Suppression.
-  static const double _nmsIouThreshold = 0.45;
+  /// Lowered from 0.45 to 0.20 to aggressively suppress duplicate boxes on the same physical note.
+  static const double _nmsIouThreshold = 0.20;
 
   bool _isReady = false;
+
+  // Throttle diagnostic prints to 1 per 60 frames to avoid logcat spam.
+  int _frameCount = 0;
+
+  // ── Tensor type / quantization metadata (populated in initModel) ──
+  TensorType _inputType  = TensorType.float32;
+  TensorType _outputType = TensorType.float32;
+  double _inputScale   = 1.0;
+  int    _inputZeroPoint  = 0;
+  double _outputScale  = 1.0;
+  int    _outputZeroPoint = 0;
 
   // ---------------------------------------------------------------------------
   // Initialisation
@@ -94,19 +107,49 @@ class AIModelService {
     // tflite_flutter exposes delegates via the options.useNnApiForAndroid
     // shorthand and the GpuDelegateV2 helper.  Both are wrapped in try/catch
     // because delegate availability depends on device and OS version.
+    //
+    // NOTE: NNAPI INT8 support is patchy on Android < 10 and some OEM devices.
+    // We detect the output type after loading and disable NNAPI for INT8 models
+    // to avoid silent all-zero output or native crashes on unsupported hardware.
+    _interpreter = await Interpreter.fromAsset(_modelPath, options: options);
+
+    // ── Capture tensor types and quantization params ──
+    final inTensor  = _interpreter!.getInputTensor(0);
+    final outTensor = _interpreter!.getOutputTensor(0);
+
+    _inputType       = inTensor.type;
+    _outputType      = outTensor.type;
+    _inputScale      = inTensor.params.scale;
+    _inputZeroPoint  = inTensor.params.zeroPoint;
+    _outputScale     = outTensor.params.scale;
+    _outputZeroPoint = outTensor.params.zeroPoint;
+
+    debugPrint(
+      'AIModelService: input  type=$_inputType  scale=$_inputScale  zp=$_inputZeroPoint',
+    );
+    debugPrint(
+      'AIModelService: output type=$_outputType scale=$_outputScale zp=$_outputZeroPoint',
+    );
+
+    // ── Enable hardware delegates only if safe for this quantization type ──
+    final isQuantized = _inputType != TensorType.float32 ||
+                        _outputType != TensorType.float32;
     try {
-      if (Platform.isAndroid) {
+      if (Platform.isAndroid && !isQuantized) {
+        // NNAPI is reliable for float32 models; skip for INT8 to avoid OEM issues.
         options.useNnApiForAndroid = true;
-        debugPrint('AIModelService: NNAPI delegate requested.');
+        debugPrint('AIModelService: NNAPI delegate enabled (float32 model).');
       } else if (Platform.isIOS) {
         options.addDelegate(GpuDelegateV2());
         debugPrint('AIModelService: Metal/GPU delegate enabled.');
+      } else if (isQuantized) {
+        debugPrint(
+          'AIModelService: INT8/UINT8 model detected — using CPU for reliability.',
+        );
       }
     } catch (e) {
-      debugPrint('AIModelService: GPU delegate unavailable, using CPU. ($e)');
+      debugPrint('AIModelService: delegate unavailable, using CPU. ($e)');
     }
-
-    _interpreter = await Interpreter.fromAsset(_modelPath, options: options);
 
     final rawLabels = await rootBundle.loadString(_labelPath);
     _labels = rawLabels
@@ -116,7 +159,7 @@ class AIModelService {
         .toList();
 
     // ── Sanity check: label count must match model output classes ──
-    final outputShape = _interpreter!.getOutputTensor(0).shape;
+    final outputShape = outTensor.shape;
     debugPrint('AIModelService: output tensor shape = $outputShape');
     // YOLOv11 raw output: [1, 4+numClasses, numAnchors]
     if (outputShape.length >= 2) {
@@ -200,63 +243,129 @@ class AIModelService {
   // ---------------------------------------------------------------------------
 
   /// Returns a list of all detected objects after NMS.
+  ///
+  /// Uses raw byte buffers (setTo / invoke / tensor.data) instead of
+  /// tflite_flutter's [run] helper.  The nested-list path in tflite_flutter
+  /// 0.10.4 writes each leaf row to offset 0 of the tensor buffer, leaving
+  /// only the last row in memory — producing the native error
+  /// "Input tensor N lacks data / failed precondition".
   List<RecognizedObject>? _runInference(Float32List flatInput, double confidenceThreshold) {
-    // ── Reshape 1D flat buffer to 4D nested list [1, 3, 640, 640] ──
-    // We transfer a flat Float32List across isolates for speed, but tflite_flutter
-    // expects a nested list matching the tensor shape, otherwise it resizes the
-    // model's input tensor to 1D and breaks internal operations like TRANSPOSE.
-    final input4D = _reshapeTo4D(flatInput, inputSize);
+    _frameCount++;
+    final bool logThisFrame = (_frameCount % 60) == 0;
 
-    final outputShape = _interpreter!.getOutputTensor(0).shape;
-    // Expected YOLOv11 raw output: [1, 4+numClasses, numAnchors]
-    final int numRows = outputShape[1];
+    final inputTensor  = _interpreter!.getInputTensor(0);
+    final outputTensor = _interpreter!.getOutputTensor(0);
+
+    final outputShape = outputTensor.shape;
+    // YOLOv11 raw output: [1, 4+numClasses, numAnchors]
+    final int numRows    = outputShape[1];
     final int numAnchors = outputShape[2];
     final int numClasses = numRows - 4;
 
-    // Allocate the output buffer that tflite_flutter will write into.
-    final output = List.generate(
-      1,
-      (_) =>
-          List.generate(numRows, (_) => List<double>.filled(numAnchors, 0.0)),
-    );
-
-    _interpreter!.run(input4D, output);
-
-    // ── 1. Parse raw anchors into candidate detections ──
-    final detections = <RecognizedObject>[];
-
-    for (int a = 0; a < numAnchors; a++) {
-      double maxScore = 0.0;
-      int bestClass = -1;
-
-      for (int c = 0; c < numClasses; c++) {
-        final score = output[0][4 + c][a];
-        if (score > maxScore) {
-          maxScore = score;
-          bestClass = c;
+    // ── Set input via raw bytes ─────────────────────────────────────────────
+    // setTo(Uint8List) writes the entire buffer atomically — safe for any size.
+    if (_inputType == TensorType.int8 || _inputType == TensorType.uint8) {
+      // Full integer quantization: float → int8 / uint8
+      final isUint8 = _inputType == TensorType.uint8;
+      final qMin = isUint8 ?   0 : -128;
+      final qMax = isUint8 ? 255 :  127;
+      if (isUint8) {
+        final quantized = Uint8List(flatInput.length);
+        for (int i = 0; i < flatInput.length; i++) {
+          quantized[i] = ((flatInput[i] / _inputScale).round() + _inputZeroPoint)
+              .clamp(qMin, qMax);
         }
+        inputTensor.setTo(quantized);
+      } else {
+        final quantized = Int8List(flatInput.length);
+        for (int i = 0; i < flatInput.length; i++) {
+          quantized[i] = ((flatInput[i] / _inputScale).round() + _inputZeroPoint)
+              .clamp(qMin, qMax);
+        }
+        inputTensor.setTo(quantized.buffer.asUint8List());
       }
+    } else {
+      // float32 / dynamic-range-quant — copy raw bytes directly
+      inputTensor.setTo(flatInput.buffer.asUint8List());
+    }
 
-      // Skip low-confidence anchors before NMS for performance.
-      if (maxScore < confidenceThreshold) continue;
-      if (bestClass < 0 || bestClass >= (_labels?.length ?? 0)) continue;
+    // ── Invoke ──────────────────────────────────────────────────────────────
+    _interpreter!.invoke();
 
-      // YOLOv11 box format: cx, cy, w, h in pixel space (0..inputSize).
-      final cx = output[0][0][a];
-      final cy = output[0][1][a];
-      final w = output[0][2][a];
-      final h = output[0][3][a];
+    // ── Read output via raw bytes ────────────────────────────────────────────
+    final outRawBytes = outputTensor.data; // Uint8List
+    final outInt8Bytes = outRawBytes.buffer.asInt8List(outRawBytes.offsetInBytes, outRawBytes.lengthInBytes);
 
-      detections.add(
-        RecognizedObject(
-          bestClass,
-          _labels![bestClass],
-          maxScore,
-          cx - w / 2, // x1
-          cy - h / 2, // y1
-          cx + w / 2, // x2
-          cy + h / 2, // y2
-        ),
+    // ── 1. Parse raw anchors into candidate detections ──────────────────────
+    final detections = <RecognizedObject>[];
+    double topRawScore = 0.0;
+
+    if (_outputType == TensorType.int8 || _outputType == TensorType.uint8) {
+      // Full integer output: read raw bytes and dequantize per element.
+      final isUint8 = _outputType == TensorType.uint8;
+      for (int a = 0; a < numAnchors; a++) {
+        double maxScore = 0.0;
+        int bestClass = -1;
+        for (int c = 0; c < numClasses; c++) {
+          final idx = (4 + c) * numAnchors + a;
+          final raw = isUint8 ? outRawBytes[idx] : outInt8Bytes[idx];
+          final score = (raw - _outputZeroPoint) * _outputScale;
+          if (score > maxScore) { maxScore = score; bestClass = c; }
+        }
+
+        if (maxScore > topRawScore) topRawScore = maxScore;
+        if (maxScore < confidenceThreshold) continue;
+        if (bestClass < 0 || bestClass >= (_labels?.length ?? 0)) continue;
+
+        double deq(int row) {
+          final idx = row * numAnchors + a;
+          final raw = isUint8 ? outRawBytes[idx] : outInt8Bytes[idx];
+          return (raw - _outputZeroPoint) * _outputScale;
+        }
+        final cx = deq(0); final cy = deq(1);
+        final bw = deq(2); final bh = deq(3);
+        detections.add(RecognizedObject(
+          bestClass, _labels![bestClass], maxScore,
+          cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2,
+        ));
+      }
+    } else {
+      // float32 output — view the byte buffer as a flat Float32List
+      final outF32 = outRawBytes.buffer.asFloat32List(
+        outRawBytes.offsetInBytes,
+        outRawBytes.lengthInBytes ~/ 4,
+      );
+
+      for (int a = 0; a < numAnchors; a++) {
+        double maxScore = 0.0;
+        int bestClass = -1;
+        for (int c = 0; c < numClasses; c++) {
+          final score = outF32[(4 + c) * numAnchors + a];
+          if (score > maxScore) { maxScore = score; bestClass = c; }
+        }
+
+        if (maxScore > topRawScore) topRawScore = maxScore;
+        if (maxScore < confidenceThreshold) continue;
+        if (bestClass < 0 || bestClass >= (_labels?.length ?? 0)) continue;
+
+        final cx = outF32[0 * numAnchors + a];
+        final cy = outF32[1 * numAnchors + a];
+        final bw = outF32[2 * numAnchors + a];
+        final bh = outF32[3 * numAnchors + a];
+        detections.add(RecognizedObject(
+          bestClass, _labels![bestClass], maxScore,
+          cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2,
+        ));
+      }
+    }
+
+    if (logThisFrame) {
+      debugPrint(
+        'AIModelService [frame $_frameCount]: '
+        'topScore=${topRawScore.toStringAsFixed(4)} '
+        'threshold=$confidenceThreshold '
+        'candidates=${detections.length} '
+        'outType=$_outputType scale=$_outputScale zp=$_outputZeroPoint',
       );
     }
 
@@ -282,6 +391,11 @@ class AIModelService {
   ) {
     // Sort descending by confidence so higher-quality boxes win.
     detections.sort((a, b) => b.confidence.compareTo(a.confidence));
+    
+    // Cap at top 100 to prevent O(N^2) explosion
+    if (detections.length > 100) {
+      detections = detections.sublist(0, 100);
+    }
 
     final suppressed = List<bool>.filled(detections.length, false);
     final kept = <RecognizedObject>[];
@@ -322,28 +436,6 @@ class AIModelService {
   // (static = safe to call inside Isolate.run)
   // ---------------------------------------------------------------------------
 
-  /// Reshapes a flat CHW Float32List back into a 4D nested list structure
-  /// `[1][3][height][width]` required by tflite_flutter.
-  static List<List<List<List<double>>>> _reshapeTo4D(
-    Float32List buffer,
-    int inputSize,
-  ) {
-    return List.generate(
-      1,
-      (_) => List.generate(
-        3,
-        (c) => List.generate(inputSize, (y) {
-          final row = List<double>.filled(inputSize, 0.0);
-          final base = c * inputSize * inputSize + y * inputSize;
-          for (int x = 0; x < inputSize; x++) {
-            row[x] = buffer[base + x];
-          }
-          return row;
-        }),
-      ),
-    );
-  }
-
   /// Preprocess a gallery image file into a [Float32List] ready for inference.
   static Float32List? _preprocessImageToFloat32(
     String imagePath,
@@ -365,38 +457,122 @@ class AIModelService {
     int inputSize,
   ) {
     try {
-      img.Image? image;
-
-      if (data.formatGroup == 'bgra8888') {
-        image = img.Image.fromBytes(
-          width: data.width,
-          height: data.height,
-          bytes: data.planes[0].bytes.buffer,
-          order: img.ChannelOrder.bgra,
-        );
-      } else {
+      if (data.formatGroup != 'bgra8888' && data.formatGroup != 'yuv420') {
         debugPrint(
-          'AIModelService: unsupported camera format "${data.formatGroup}". Expected bgra8888.',
+          'AIModelService: unsupported camera format "${data.formatGroup}". Expected bgra8888 or yuv420.',
         );
         return null;
       }
-      
-      // Correct sensor rotation before resizing.
-      if (data.sensorOrientation != 0) {
-        image = img.copyRotate(image, angle: data.sensorOrientation);
-      }
 
-      return _resizeAndLetterbox(image, inputSize);
+      return _fastResizeAndLetterbox(data, inputSize);
     } catch (e) {
+      debugPrint('AIModelService: preprocessing error: $e');
       return null;
     }
   }
 
+  /// High-performance nearest-neighbor resize + letterbox directly from raw bytes.
+  /// Bypasses the `image` package to avoid allocations and massive CPU overhead.
+  /// Reads only the exact pixels needed for the 640x640 output.
+  static Float32List _fastResizeAndLetterbox(
+    IsolateCameraImage data,
+    int inputSize,
+  ) {
+    final srcWidth = data.width;
+    final srcHeight = data.height;
+    final orientation = data.sensorOrientation;
+
+    // Determine effective dimensions after rotation
+    final bool isPortrait = orientation == 90 || orientation == 270;
+    final effWidth = isPortrait ? srcHeight : srcWidth;
+    final effHeight = isPortrait ? srcWidth : srcHeight;
+
+    // Scale and letterbox dimensions
+    final scale = min(inputSize / effWidth, inputSize / effHeight);
+    final targetW = (effWidth * scale).round();
+    final targetH = (effHeight * scale).round();
+    final dx = (inputSize - targetW) ~/ 2;
+    final dy = (inputSize - targetH) ~/ 2;
+
+    // Allocate the flat CHW buffer
+    final buffer = Float32List(3 * inputSize * inputSize)
+      ..fillRange(0, 3 * inputSize * inputSize, _letterboxFill);
+
+    final isYUV = data.formatGroup == 'yuv420';
+    final p0 = data.planes[0];
+    final p1 = data.planes.length > 1 ? data.planes[1] : p0;
+    final p2 = data.planes.length > 2 ? data.planes[2] : p0;
+
+    for (int y = 0; y < targetH; y++) {
+      final effY = (y / scale).floor().clamp(0, effHeight - 1);
+      
+      for (int x = 0; x < targetW; x++) {
+        final effX = (x / scale).floor().clamp(0, effWidth - 1);
+
+        // Map effective (rotated) coords back to raw source coords
+        int srcX, srcY;
+        switch (orientation) {
+          case 90:
+            srcX = effY;
+            srcY = srcHeight - 1 - effX;
+            break;
+          case 180:
+            srcX = srcWidth - 1 - effX;
+            srcY = srcHeight - 1 - effY;
+            break;
+          case 270:
+            srcX = srcWidth - 1 - effY;
+            srcY = effX;
+            break;
+          default: // 0
+            srcX = effX;
+            srcY = effY;
+        }
+
+        double r = 0, g = 0, b = 0;
+
+        if (isYUV) {
+          // YUV420 to RGB
+          final yIndex = srcY * p0.bytesPerRow + srcX;
+          final uvX = srcX ~/ 2;
+          final uvY = srcY ~/ 2;
+          final uIndex = uvY * p1.bytesPerRow + uvX * p1.bytesPerPixel;
+          final vIndex = uvY * p2.bytesPerRow + uvX * p2.bytesPerPixel;
+
+          final yVal = p0.bytes[yIndex];
+          final uVal = p1.bytes[uIndex];
+          final vVal = p2.bytes[vIndex];
+
+          final c = yVal - 16;
+          final d = uVal - 128;
+          final e = vVal - 128;
+
+          r = (1.164 * c + 1.596 * e).clamp(0, 255) / 255.0;
+          g = (1.164 * c - 0.391 * d - 0.813 * e).clamp(0, 255) / 255.0;
+          b = (1.164 * c + 2.018 * d).clamp(0, 255) / 255.0;
+        } else {
+          // BGRA8888 to RGB
+          final offset = srcY * p0.bytesPerRow + srcX * 4;
+          b = p0.bytes[offset] / 255.0;
+          g = p0.bytes[offset + 1] / 255.0;
+          r = p0.bytes[offset + 2] / 255.0;
+        }
+
+        final outY = y + dy;
+        final outX = x + dx;
+        final base = outY * inputSize + outX;
+        
+        buffer[0 * inputSize * inputSize + base] = r;
+        buffer[1 * inputSize * inputSize + base] = g;
+        buffer[2 * inputSize * inputSize + base] = b;
+      }
+    }
+
+    return buffer;
+  }
+
   /// Aspect-ratio-preserving resize + centre letterbox to inputSize x inputSize.
-  ///
-  /// FIX (C-06): Returns a compact [Float32List] in CHW (channels-first) format
-  /// normalised to `[0, 1]`.  This is approximately 5 MB vs 31 MB for the
-  /// previous nested list approach and transfers efficiently across isolates.
+  /// Used for still images (gallery/takePicture) loaded via `img` package.
   static Float32List _resizeAndLetterbox(img.Image image, int inputSize) {
     // Scale the longer side to inputSize, preserving aspect ratio.
     final scaleX = inputSize / image.width;

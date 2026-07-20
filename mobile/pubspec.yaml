@@ -47,6 +47,8 @@ dependencies:
   tflite_flutter: ^0.12.1
   image: ^4.1.7
   haptic_feedback: ^0.6.5
+  uuid: ^4.6.0
+  intl: ^0.20.3
 
 dev_dependencies:
   flutter_test:
