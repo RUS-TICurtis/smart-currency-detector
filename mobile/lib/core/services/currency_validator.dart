@@ -31,7 +31,7 @@ class CurrencyValidator {
     }
 
     if (kDebugMode && rejectedCount > 0) {
-      print('CurrencyValidator: Rejected/Capped $rejectedCount overlapping or invalid bounding boxes.');
+      debugPrint('CurrencyValidator: Rejected/Capped $rejectedCount overlapping or invalid bounding boxes.');
     }
 
     return validatedCounts;
