@@ -1,7 +1,13 @@
-100 Cedis
-10 Cedis
-1 Cedi
-200 Cedis
-20 Cedis
-50 Cedis
-5 Cedis
+100_cedi
+10_cedi
+10_pesewas_coin
+1_cedi
+1_cedi_coin
+200_cedi
+20_cedi
+20_pesewas_coin
+2_cedi
+2_cedi_coin
+50_cedi
+50_pesewas_coin
+5_cedi

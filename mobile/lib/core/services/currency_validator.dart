@@ -22,7 +22,12 @@ class CurrencyValidator {
       }
 
       final currentCount = validatedCounts[denomination] ?? 0;
-      if (currentCount < maxNotesPerDenomination) {
+      
+      // Coins are physically smaller, so we can reasonably expect up to 15 in a single frame.
+      // Notes are larger, so we cap them at 5 to prevent duplicate bounding box hallucinations.
+      final maxAllowed = denomination.value < 1.0 ? 15 : 5;
+
+      if (currentCount < maxAllowed) {
         validatedCounts[denomination] = currentCount + 1;
       } else {
         // We hit the cap. Ignore this duplicate bounding box to prevent hallucinated aggregation.
