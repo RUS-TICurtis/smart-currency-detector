@@ -31,12 +31,8 @@ class SessionState {
 }
 
 class SessionNotifier extends Notifier<SessionState> {
-  // Tracking the last added detection to prevent duplicate spam.
+  // Tracking the last added detection to prevent duplicate spam until notes/coins exit view.
   Map<GhanaCedi, int> _lastAddedDetection = {};
-  Timer? _cooldownTimer;
-  
-  // A cooldown duration before the same note configuration can be added again.
-  static const Duration _cooldownDuration = Duration(seconds: 3);
 
   @override
   SessionState build() {
@@ -44,15 +40,13 @@ class SessionNotifier extends Notifier<SessionState> {
   }
 
   /// Process stable detections from the camera.
-  /// Only adds to the running total if the detected notes have changed
-  /// since the last addition, or if the cooldown has expired.
+  /// Only adds to the running total if new notes/coins have been added
+  /// or if scanner tracking was reset (e.g. note removed from camera view).
   /// Returns the added value if anything was added, otherwise 0.
   double processDetection(Map<GhanaCedi, int> stableCounts) {
     if (stableCounts.isEmpty) return 0.0;
 
-    // Check if stableCounts is exactly the same or a subset of the last added detection.
-    // E.g., if we just added 2x GHS 10, we don't want to add 2x GHS 10 again until cooldown,
-    // nor do we want to add 1x GHS 10 (likely just one of the notes became obscured).
+    // Check if stableCounts is higher in count or contains a new denomination
     bool isNewDetection = false;
     for (final entry in stableCounts.entries) {
       final denomination = entry.key;
@@ -65,7 +59,6 @@ class SessionNotifier extends Notifier<SessionState> {
       }
     }
 
-    // Also check if there's a completely new denomination not in the last detection
     for (final denom in stableCounts.keys) {
       if (!_lastAddedDetection.containsKey(denom)) {
         isNewDetection = true;
@@ -73,12 +66,12 @@ class SessionNotifier extends Notifier<SessionState> {
       }
     }
 
-    if (!isNewDetection && _cooldownTimer != null && _cooldownTimer!.isActive) {
-      // It's the same or lesser detection, and we're in cooldown. Ignore.
+    if (!isNewDetection) {
+      // The same or a subset of the currently tracked item is still in view.
       return 0.0;
     }
 
-    // It's a new detection, OR cooldown expired. Add it.
+    // It's a new or additional detection. Add it to total.
     double addedValue = 0.0;
     int addedNotes = 0;
     final newCounts = Map<GhanaCedi, int>.from(state.denominationCounts);
@@ -95,21 +88,15 @@ class SessionNotifier extends Notifier<SessionState> {
       denominationCounts: newCounts,
     );
 
-    // Update tracking and reset cooldown timer
+    // Update tracking lock until note/coin exits camera view
     _lastAddedDetection = Map.from(stableCounts);
-    _cooldownTimer?.cancel();
-    _cooldownTimer = Timer(_cooldownDuration, () {
-      // Once cooldown is over, user can scan the exact same notes again.
-      _lastAddedDetection.clear();
-    });
 
     return addedValue;
   }
 
   void resetScannerTracking() {
-    // If the camera explicitly sees NO notes for a few frames, we can reset the tracking early.
+    // Called when camera sees no currency items for several consecutive frames.
     _lastAddedDetection.clear();
-    _cooldownTimer?.cancel();
   }
 
   void clearSession() {

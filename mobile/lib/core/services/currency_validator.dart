@@ -26,7 +26,7 @@ class CurrencyValidator {
       
       // Coins are physically smaller; we cap them at maxCoinsPerDetection.
       // Notes are larger; cap at maxNotesPerDetection to prevent hallucinated duplicates.
-      final maxAllowed = denomination.value < 1.0 ? maxCoinsPerDetection : maxNotesPerDetection;
+      final maxAllowed = denomination.isCoin ? maxCoinsPerDetection : maxNotesPerDetection;
 
       if (currentCount < maxAllowed) {
         validatedCounts[denomination] = currentCount + 1;

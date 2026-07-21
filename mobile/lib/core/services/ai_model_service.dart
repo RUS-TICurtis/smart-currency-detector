@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
+import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -93,6 +94,7 @@ class AIModelService {
   int _inputZeroPoint = 0;
   double _outputScale = 1.0;
   int _outputZeroPoint = 0;
+  bool _isInputNhwc = false;
 
   // ---------------------------------------------------------------------------
   // Initialisation
@@ -132,8 +134,12 @@ class AIModelService {
     _outputScale = outTensor.params.scale;
     _outputZeroPoint = outTensor.params.zeroPoint;
 
+    // Determine input tensor layout (NHWC [1, 640, 640, 3] vs NCHW [1, 3, 640, 640])
+    final inShape = inTensor.shape;
+    _isInputNhwc = inShape.length == 4 && inShape[3] == 3;
+
     debugPrint(
-      'AIModelService: input  type=$_inputType  scale=$_inputScale  zp=$_inputZeroPoint',
+      'AIModelService: input type=$_inputType scale=$_inputScale zp=$_inputZeroPoint isNhwc=$_isInputNhwc',
     );
     debugPrint(
       'AIModelService: output type=$_outputType scale=$_outputScale zp=$_outputZeroPoint',
@@ -177,34 +183,33 @@ class AIModelService {
     String imagePath,
     double confidenceThreshold,
   ) async {
-    if (!_isReady) return null;
+    if (!_isReady || _interpreter == null) return null;
     try {
+      final isNhwc = _isInputNhwc;
+      
+      // Native fast decode using Flutter's engine
+      final bytes = await File(imagePath).readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      final uiImage = frame.image;
+      
+      final byteData = await uiImage.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (byteData == null) return null;
+      
+      final width = uiImage.width;
+      final height = uiImage.height;
+      uiImage.dispose();
+      
+      final rgbaBytes = byteData.buffer.asUint8List();
+      
       // Preprocessing is CPU-heavy — offload to a background isolate.
-      // Float32List is a TypedData and transfers efficiently across isolates.
       final isolateInput = await Isolate.run(
-        () => _preprocessImageToFloat32(imagePath, inputSize),
+        () => _preprocessRgbaToFloat32(rgbaBytes, width, height, inputSize, isNhwc),
       );
       if (isolateInput == null) return null;
       
-      // Deep copy to break Isolate TransferableTypedData memory linkage
       final input = Float32List.fromList(isolateInput);
-      // Create a clean, temporary Interpreter to avoid any corrupted state or 
-      // concurrent memory issues with the Auto-scan interpreter.
-      final options = InterpreterOptions();
-      if (Platform.isAndroid) {
-        options.threads = 1;
-        options.useNnApiForAndroid = true;
-      } else if (Platform.isIOS) {
-        options.addDelegate(GpuDelegate());
-      }
-      final tempInterpreter = await Interpreter.fromAsset(
-        _modelPath,
-        options: options,
-      );
-
-      final results = _runInference(tempInterpreter, input, confidenceThreshold);
-      tempInterpreter.close();
-      return results;
+      return _runInference(_interpreter!, input, confidenceThreshold);
     } catch (e) {
       debugPrint('AIModelService: gallery inference error: $e');
       return null;
@@ -235,10 +240,9 @@ class AIModelService {
         sensorOrientation,
       );
 
-      // FIX (C-06): return a compact Float32List instead of
-      // List<List<List<List<double>>>> to avoid ~31 MB isolate serialisation.
+      final isNhwc = _isInputNhwc;
       final input = await Isolate.run(
-        () => _preprocessCameraImageToFloat32(isolateData, inputSize),
+        () => _preprocessCameraImageToFloat32(isolateData, inputSize, isNhwc),
       );
       if (input == null) return null;
       return _runInference(_interpreter!, input, confidenceThreshold);
@@ -499,16 +503,53 @@ class AIModelService {
   // (static = safe to call inside Isolate.run)
   // ---------------------------------------------------------------------------
 
-  /// Preprocess a gallery image file into a [Float32List] ready for inference.
-  static Float32List? _preprocessImageToFloat32(
-    String imagePath,
+  /// Preprocess a raw RGBA byte array into a [Float32List] ready for inference.
+  static Float32List? _preprocessRgbaToFloat32(
+    Uint8List rgbaBytes,
+    int srcWidth,
+    int srcHeight,
     int inputSize,
+    bool isNhwc,
   ) {
     try {
-      final bytes = File(imagePath).readAsBytesSync();
-      final image = img.decodeImage(bytes);
-      if (image == null) return null;
-      return _resizeAndLetterbox(image, inputSize);
+      final scale = min(inputSize / srcWidth, inputSize / srcHeight);
+      final targetW = (srcWidth * scale).round();
+      final targetH = (srcHeight * scale).round();
+      final dx = (inputSize - targetW) ~/ 2;
+      final dy = (inputSize - targetH) ~/ 2;
+
+      final buffer = Float32List(3 * inputSize * inputSize)
+        ..fillRange(0, 3 * inputSize * inputSize, _letterboxFill);
+
+      for (int y = 0; y < targetH; y++) {
+        final srcY = (y / scale).floor().clamp(0, srcHeight - 1);
+        final rowOffset = srcY * srcWidth * 4;
+        
+        for (int x = 0; x < targetW; x++) {
+          final srcX = (x / scale).floor().clamp(0, srcWidth - 1);
+          final offset = rowOffset + srcX * 4;
+
+          final r = rgbaBytes[offset] / 255.0;
+          final g = rgbaBytes[offset + 1] / 255.0;
+          final b = rgbaBytes[offset + 2] / 255.0;
+
+          final outY = y + dy;
+          final outX = x + dx;
+
+          if (isNhwc) {
+            final base = (outY * inputSize + outX) * 3;
+            buffer[base + 0] = r;
+            buffer[base + 1] = g;
+            buffer[base + 2] = b;
+          } else {
+            final base = outY * inputSize + outX;
+            buffer[0 * inputSize * inputSize + base] = r;
+            buffer[1 * inputSize * inputSize + base] = g;
+            buffer[2 * inputSize * inputSize + base] = b;
+          }
+        }
+      }
+      return buffer;
     } catch (e) {
       return null;
     }
@@ -518,6 +559,7 @@ class AIModelService {
   static Float32List? _preprocessCameraImageToFloat32(
     IsolateCameraImage data,
     int inputSize,
+    bool isNhwc,
   ) {
     try {
       if (data.formatGroup != 'bgra8888' && data.formatGroup != 'yuv420') {
@@ -527,7 +569,7 @@ class AIModelService {
         return null;
       }
 
-      return _fastResizeAndLetterbox(data, inputSize);
+      return _fastResizeAndLetterbox(data, inputSize, isNhwc);
     } catch (e) {
       debugPrint('AIModelService: preprocessing error: $e');
       return null;
@@ -540,6 +582,7 @@ class AIModelService {
   static Float32List _fastResizeAndLetterbox(
     IsolateCameraImage data,
     int inputSize,
+    bool isNhwc,
   ) {
     final srcWidth = data.width;
     final srcHeight = data.height;
@@ -557,17 +600,13 @@ class AIModelService {
     final dx = (inputSize - targetW) ~/ 2;
     final dy = (inputSize - targetH) ~/ 2;
 
-    // Allocate the flat HWC buffer (NHWC layout: [R,G,B interleaved per pixel])
+    // Allocate the flat buffer
     final buffer = Float32List(3 * inputSize * inputSize)
       ..fillRange(0, 3 * inputSize * inputSize, _letterboxFill);
 
     final isYUV = data.formatGroup == 'yuv420';
     final p0 = data.planes[0];
     final p1 = data.planes.length > 1 ? data.planes[1] : p0;
-    // BUG-06 FIX: Fall back to p1 (chroma) rather than p0 (luma) when fewer
-    // than 3 planes are reported. In NV21/NV12 semi-planar format planes[1] and
-    // planes[2] reference the same interleaved UV buffer with a 1-byte offset,
-    // so p1 is always a better chroma substitute than the Y plane (p0).
     final p2 = data.planes.length > 2 ? data.planes[2] : p1;
 
     for (int y = 0; y < targetH; y++) {
@@ -613,7 +652,6 @@ class AIModelService {
             final vIndex = uvY * p2.bytesPerRow + uvX * p2.bytesPerPixel;
             vVal = p2.bytes[vIndex];
           } else {
-            // If only 2 planes exist, UV are interleaved in p1. The next byte is V.
             vVal = (uIndex + 1 < p1.bytes.length) ? p1.bytes[uIndex + 1] : uVal;
           }
 
@@ -634,11 +672,20 @@ class AIModelService {
 
         final outY = y + dy;
         final outX = x + dx;
-        // CHW planar layout matching PyTorch native export [1,3,640,640]
-        final base = outY * inputSize + outX;
-        buffer[0 * inputSize * inputSize + base] = r; // R
-        buffer[1 * inputSize * inputSize + base] = g; // G
-        buffer[2 * inputSize * inputSize + base] = b; // B
+
+        if (isNhwc) {
+          // NHWC interleaved layout: [1, 640, 640, 3]
+          final base = (outY * inputSize + outX) * 3;
+          buffer[base + 0] = r;
+          buffer[base + 1] = g;
+          buffer[base + 2] = b;
+        } else {
+          // CHW planar layout: [1, 3, 640, 640]
+          final base = outY * inputSize + outX;
+          buffer[0 * inputSize * inputSize + base] = r;
+          buffer[1 * inputSize * inputSize + base] = g;
+          buffer[2 * inputSize * inputSize + base] = b;
+        }
       }
     }
 
@@ -647,7 +694,7 @@ class AIModelService {
 
   /// Aspect-ratio-preserving resize + centre letterbox to inputSize x inputSize.
   /// Used for still images (gallery/takePicture) loaded via `img` package.
-  static Float32List _resizeAndLetterbox(img.Image image, int inputSize) {
+  static Float32List _resizeAndLetterbox(img.Image image, int inputSize, bool isNhwc) {
     // Scale the longer side to inputSize, preserving aspect ratio.
     final scaleX = inputSize / image.width;
     final scaleY = inputSize / image.height;
@@ -667,21 +714,32 @@ class AIModelService {
     final dx = (inputSize - targetW) ~/ 2;
     final dy = (inputSize - targetH) ~/ 2;
 
-    // Allocate the flat HWC buffer (NHWC layout: [R,G,B interleaved per pixel])
+    // Allocate the flat buffer
     final buffer = Float32List(3 * inputSize * inputSize)
       ..fillRange(0, 3 * inputSize * inputSize, _letterboxFill);
 
-    // Copy resized pixels into CHW layout.
     for (int y = 0; y < targetH; y++) {
       for (int x = 0; x < targetW; x++) {
         final pixel = resized.getPixel(x, y);
         final outY = y + dy;
         final outX = x + dx;
-        // CHW planar layout matching PyTorch native export [1,3,640,640]
-        final base = outY * inputSize + outX;
-        buffer[0 * inputSize * inputSize + base] = pixel.r / 255.0; // R
-        buffer[1 * inputSize * inputSize + base] = pixel.g / 255.0; // G
-        buffer[2 * inputSize * inputSize + base] = pixel.b / 255.0; // B
+        final r = pixel.r / 255.0;
+        final g = pixel.g / 255.0;
+        final b = pixel.b / 255.0;
+
+        if (isNhwc) {
+          // NHWC interleaved layout: [1, 640, 640, 3]
+          final base = (outY * inputSize + outX) * 3;
+          buffer[base + 0] = r;
+          buffer[base + 1] = g;
+          buffer[base + 2] = b;
+        } else {
+          // CHW planar layout: [1, 3, 640, 640]
+          final base = outY * inputSize + outX;
+          buffer[0 * inputSize * inputSize + base] = r;
+          buffer[1 * inputSize * inputSize + base] = g;
+          buffer[2 * inputSize * inputSize + base] = b;
+        }
       }
     }
 

@@ -1,23 +1,61 @@
 enum GhanaCedi {
-  pesewa10(0.10),
-  pesewa20(0.20),
-  pesewa50(0.50),
-  ghs1(1.0),
-  ghs2(2.0),
-  ghs5(5.0),
-  ghs10(10.0),
-  ghs20(20.0),
-  ghs50(50.0),
-  ghs100(100.0),
-  ghs200(200.0);
+  pesewa10(0.10, isCoin: true),
+  pesewa20(0.20, isCoin: true),
+  pesewa50(0.50, isCoin: true),
+  ghs1Coin(1.0, isCoin: true),
+  ghs1Note(1.0, isCoin: false),
+  ghs2Coin(2.0, isCoin: true),
+  ghs2Note(2.0, isCoin: false),
+  ghs5(5.0, isCoin: false),
+  ghs10(10.0, isCoin: false),
+  ghs20(20.0, isCoin: false),
+  ghs50(50.0, isCoin: false),
+  ghs100(100.0, isCoin: false),
+  ghs200(200.0, isCoin: false);
 
   final double value;
+  final bool isCoin;
 
-  const GhanaCedi(this.value);
+  const GhanaCedi(this.value, {required this.isCoin});
 
-  /// Safely parse a raw string label (e.g. "100 Cedis" or "10_pesewas_coin") into a validated Enum.
+  /// Indicates whether this item is a "coin" or a "note".
+  String get itemType => isCoin ? 'coin' : 'note';
+
+  /// Safely parse a raw string label into a validated Enum.
   static GhanaCedi? fromString(String label) {
     final lowerLabel = label.toLowerCase();
+    
+    // Explicit label matching
+    switch (lowerLabel) {
+      case '100_cedi':
+        return GhanaCedi.ghs100;
+      case '10_cedi':
+        return GhanaCedi.ghs10;
+      case '10_pesewas_coin':
+        return GhanaCedi.pesewa10;
+      case '1_cedi':
+        return GhanaCedi.ghs1Note;
+      case '1_cedi_coin':
+        return GhanaCedi.ghs1Coin;
+      case '200_cedi':
+        return GhanaCedi.ghs200;
+      case '20_cedi':
+        return GhanaCedi.ghs20;
+      case '20_pesewas_coin':
+        return GhanaCedi.pesewa20;
+      case '2_cedi':
+        return GhanaCedi.ghs2Note;
+      case '2_cedi_coin':
+        return GhanaCedi.ghs2Coin;
+      case '50_cedi':
+        return GhanaCedi.ghs50;
+      case '50_pesewas_coin':
+        return GhanaCedi.pesewa50;
+      case '5_cedi':
+        return GhanaCedi.ghs5;
+    }
+
+    // Dynamic heuristic fallback
     final match = RegExp(r'\d+').firstMatch(label);
     if (match == null) return null;
     
@@ -25,20 +63,22 @@ enum GhanaCedi {
     if (number == null) return null;
 
     final isPesewa = lowerLabel.contains('pesewa');
+    final checkCoin = lowerLabel.contains('coin') || isPesewa;
     final actualValue = isPesewa ? (number / 100.0) : number;
 
     for (final note in GhanaCedi.values) {
-      if ((note.value - actualValue).abs() < 0.001) {
+      if ((note.value - actualValue).abs() < 0.001 && note.isCoin == checkCoin) {
         return note;
       }
     }
-    return null; // Reject completely unknown or hallucinated numbers
+    return null; // Reject unknown
   }
 
   String get displayName {
     if (value < 1.0) {
-      return '${(value * 100).toInt()} Pesewas';
+      return '${(value * 100).toInt()} Pesewas coin';
     }
-    return '${value.toInt()} Cedis';
+    final unit = isCoin ? 'coin' : 'note';
+    return '${value.toInt()} Cedi $unit';
   }
 }

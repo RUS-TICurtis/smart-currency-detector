@@ -207,8 +207,11 @@ class CameraScreen extends HookConsumerWidget {
                 // (3 empty frames total = 600ms grace period)
                 int emptyCount = 0;
                 for (int i = history.length - 1; i >= 0; i--) {
-                  if (history[i].isEmpty) emptyCount++;
-                  else break;
+                  if (history[i].isEmpty) {
+                    emptyCount++;
+                  } else {
+                    break;
+                  }
                 }
                 if (emptyCount >= 2) {
                   currentDetections.value = [];
@@ -240,35 +243,43 @@ class CameraScreen extends HookConsumerWidget {
 
                 // ── 3. Process with SessionProvider ──
                 if (stableCounts.isNotEmpty) {
-                  // Camera is actively seeing stable notes — reset the empty-window counter.
+                  // Camera is actively seeing stable items — reset the empty-window counter.
                   consecutiveEmptyWindows.value = 0;
                   final addedValue = ref.read(sessionProvider.notifier).processDetection(stableCounts);
                   
                   if (addedValue > 0) {
                     Haptics.vibrate(HapticsType.success);
                     final total = ref.read(sessionProvider).totalValue;
-                    final summary = 'Added ${addedValue.toStringAsFixed(0)} Cedis. Total is now ${total.toStringAsFixed(0)} Cedis.';
+                    final parts = <String>[];
+                    stableCounts.forEach((denomination, count) {
+                      final unit = denomination.isCoin ? 'coin' : 'note';
+                      final plural = count > 1 ? '${unit}s' : unit;
+                      if (denomination.value < 1.0) {
+                        parts.add('$count, ${(denomination.value * 100).toInt()} Pesewas $plural');
+                      } else {
+                        parts.add('$count, ${denomination.value.toInt()} Cedi $plural');
+                      }
+                    });
+
+                    final summary = 'Added ${parts.join(', ')}. Total is now ${total.toStringAsFixed(0)} Cedis.';
                     ref.read(speechServiceProvider).speak(summary);
-                    scanStatus.value = 'Added GHS ${addedValue.toStringAsFixed(2)}\nTotal: GHS ${total.toStringAsFixed(2)}';
+                    scanStatus.value = 'Added ${parts.join(', ')}\nTotal: GHS ${total.toStringAsFixed(2)}';
                   } else {
-                    // It's stable but ignored due to cooldown.
-                    // Prevent overwriting the 'Added GHS...' success message immediately.
-                    if (!scanStatus.value.startsWith('Added GHS') && scanStatus.value != 'Note already scanned') {
+                    // It's stable but already tracked in the current view.
+                    if (!scanStatus.value.startsWith('Added') && scanStatus.value != 'Currency already scanned') {
                        Haptics.vibrate(HapticsType.light);
-                       scanStatus.value = 'Note already scanned';
+                       scanStatus.value = 'Currency already scanned';
                     }
                   }
                 } else {
-                  // No stable detection this window. Only reset the duplicate guard
-                  // after 15 consecutive empty windows (15 * 200ms = 3 seconds), so a momentary
-                  // note repositioning doesn't allow an immediate double-count.
+                  // No stable detection this window. Reset tracking lock after 15 consecutive empty windows (~3 seconds)
                   consecutiveEmptyWindows.value++;
                   if (consecutiveEmptyWindows.value >= 15) {
                     ref.read(sessionProvider.notifier).resetScannerTracking();
                     consecutiveEmptyWindows.value = 0;
-                    scanStatus.value = 'Could not detect note';
+                    scanStatus.value = 'Searching for currency...';
                   } else if (scanStatus.value.startsWith('Verifying') || scanStatus.value == 'Ready to scan') {
-                    scanStatus.value = 'Searching for notes...';
+                    scanStatus.value = 'Searching for notes & coins...';
                   }
                 }
               } else {
@@ -332,7 +343,7 @@ class CameraScreen extends HookConsumerWidget {
                     Positioned.fill(
                       child: Image.memory(
                         snapshotBytes.value!,
-                        fit: BoxFit.cover,
+                        fit: BoxFit.contain,
                       ),
                     ),
                   RepaintBoundary(
@@ -570,52 +581,34 @@ class CameraScreen extends HookConsumerWidget {
                                         : () async {
                                             if (!isMounted()) return;
                                             isProcessing.value = true;
-                                            scanStatus.value = 'Scanning note...';
-                                            currentDetections.value = [];
-                                            snapshotBytes.value = null;
-
-                                            final speechService = ref
-                                                .read(speechServiceProvider);
-                                            await speechService.speak(
-                                              'Scanning note. Please hold steady.',
-                                            );
+                                            scanStatus.value = 'Scanning...';
+                                            final speechService = ref.read(speechServiceProvider);
+                                            speechService.speak('Scanning. Please hold steady.');
 
                                             try {
-                                              final controller =
-                                                  cameraState.value!;
-                                              final aiService =
-                                                  aiState.value!;
+                                              final controller = cameraState.value!;
+                                              final aiService = aiState.value!;
                                               List<RecognizedObject>? prediction;
 
                                               if (!isMounted()) return;
                                               scanStatus.value = 'Analysing...';
 
                                               if (settings.autoScan) {
-                                                // Use the most recent stream frame.
-                                                final image =
-                                                    latestImage.value;
+                                                final image = latestImage.value;
                                                 if (image == null) {
-                                                  throw Exception(
-                                                    'No camera frame ready yet.',
-                                                  );
+                                                  throw Exception('No camera frame ready yet.');
                                                 }
-                                                prediction = await aiService
-                                                    .predictFromCameraImage(
+                                                prediction = await aiService.predictFromCameraImage(
                                                   image,
-                                                  controller.description
-                                                      .sensorOrientation,
+                                                  controller.description.sensorOrientation,
                                                   settings.confidenceThreshold,
                                                 );
                                               } else {
-                                                // Take a still picture.
                                                 final xFile = await controller.takePicture();
-                                                
-                                                // Read bytes for preview
                                                 final bytes = await xFile.readAsBytes();
                                                 if (isMounted()) {
                                                   snapshotBytes.value = bytes;
                                                 }
-
                                                 prediction = await aiService.predict(
                                                   xFile.path,
                                                   settings.confidenceThreshold,
@@ -632,24 +625,27 @@ class CameraScreen extends HookConsumerWidget {
                                                   
                                                   validatedCounts.forEach((denomination, count) {
                                                     totalValue += denomination.value * count;
-                                                    parts.add('$count, ${denomination.displayName} note${count > 1 ? 's' : ''}');
+                                                    final unit = denomination.isCoin ? 'coin' : 'note';
+                                                    final plural = count > 1 ? '${unit}s' : unit;
+                                                    if (denomination.value < 1.0) {
+                                                      parts.add('$count, ${(denomination.value * 100).toInt()} Pesewas $plural');
+                                                    } else {
+                                                      parts.add('$count, ${denomination.value.toInt()} Cedi $plural');
+                                                    }
                                                   });
                                                   
                                                   final summary = '${parts.join(', ')}. Total value: ${totalValue.toStringAsFixed(2)} Ghana Cedis.';
-
                                                   scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toStringAsFixed(2)}';
                                                   await speechService.speak(summary);
                                                 } else {
-                                                  // All bounding boxes were rejected by validator
-                                                  scanStatus.value = 'Could not detect valid note.';
-                                                  await speechService.speak('Could not clearly detect a valid note.');
+                                                  scanStatus.value = 'Could not detect valid currency.';
+                                                  await speechService.speak('Could not clearly detect valid currency.');
                                                 }
                                               } else {
-                                                scanStatus.value =
-                                                    'Could not detect note.';
+                                                scanStatus.value = 'Could not detect currency.';
                                                 await speechService.speak(
-                                                  'Could not clearly detect the note. '
-                                                  'Please ensure the note is well lit '
+                                                  'Could not clearly detect currency. '
+                                                  'Please ensure the item is well lit '
                                                   'and centred in the camera.',
                                                 );
                                               }
@@ -675,7 +671,7 @@ class CameraScreen extends HookConsumerWidget {
                                   Icons.document_scanner,
                                   size: 28,
                                 ),
-                                label: const Text('SCAN NOTE'),
+                                label: const Text('SCAN'),
                                 style: ElevatedButton.styleFrom(
                                   shape: RoundedRectangleBorder(
                                     borderRadius: BorderRadius.circular(20),

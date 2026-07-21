@@ -55,14 +55,17 @@ class DetectionSessionAdapter extends TypeAdapter<DetectionSession> {
       final denominationStr = reader.readString();
       final count = reader.readInt();
 
-      // BUG-10 FIX: Both fields must always be read to keep the binary stream
-      // aligned, even if we ultimately skip this entry. We no longer silently
-      // fall back to ghs1 — that would corrupt saved session totals after any
-      // enum rename. Unknown names are logged and skipped instead.
+      // Handle legacy enum string names from previous sessions
+      final effectiveName = denominationStr == 'ghs1'
+          ? 'ghs1Note'
+          : denominationStr == 'ghs2'
+              ? 'ghs2Note'
+              : denominationStr;
+
       GhanaCedi? denomination;
       try {
         denomination = GhanaCedi.values.firstWhere(
-          (e) => e.name == denominationStr,
+          (e) => e.name == effectiveName,
         );
       } catch (_) {
         debugPrint(
