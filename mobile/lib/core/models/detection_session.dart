@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:hive/hive.dart';
 import 'ghana_cedi_denomination.dart';
 
@@ -53,14 +54,24 @@ class DetectionSessionAdapter extends TypeAdapter<DetectionSession> {
     for (var i = 0; i < mapLength; i++) {
       final denominationStr = reader.readString();
       final count = reader.readInt();
-      
-      // Parse string back to enum
-      final denomination = GhanaCedi.values.firstWhere(
-        (e) => e.name == denominationStr,
-        // Fallback for safety if enum names change, though they shouldn't.
-        orElse: () => GhanaCedi.ghs1, 
-      );
-      
+
+      // BUG-10 FIX: Both fields must always be read to keep the binary stream
+      // aligned, even if we ultimately skip this entry. We no longer silently
+      // fall back to ghs1 — that would corrupt saved session totals after any
+      // enum rename. Unknown names are logged and skipped instead.
+      GhanaCedi? denomination;
+      try {
+        denomination = GhanaCedi.values.firstWhere(
+          (e) => e.name == denominationStr,
+        );
+      } catch (_) {
+        debugPrint(
+          'DetectionSessionAdapter: Unknown denomination "$denominationStr" '
+          'in saved history — skipping entry.',
+        );
+        continue;
+      }
+
       denominationCounts[denomination] = count;
     }
 

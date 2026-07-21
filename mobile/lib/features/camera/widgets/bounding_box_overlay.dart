@@ -24,16 +24,19 @@ class BoundingBoxOverlay extends StatelessWidget {
         final previewSize = cameraController.value.previewSize;
         if (previewSize == null) return const SizedBox.shrink();
 
-        // Calculate aspect ratio. CameraPreview rotates depending on orientation.
-        final bool isLandscape =
-            MediaQuery.of(context).orientation == Orientation.landscape;
-        
-        // previewSize is usually expressed in landscape (e.g., 1920x1080)
-        // so we need to swap width and height if we are in portrait mode.
+        // BUG-07 FIX: Use the camera sensor's physical orientation (from the camera
+        // description) rather than the device's current UI orientation. The preprocessor
+        // rotates source pixels using sensorOrientation, so the bounding box coordinate
+        // space must match that same effective dimension computation.
+        // previewSize is expressed in the sensor's native landscape dimensions.
+        final int sensorOrientation =
+            cameraController.description.sensorOrientation;
+        final bool isPortraitSensor =
+            sensorOrientation == 90 || sensorOrientation == 270;
         final double videoWidth =
-            isLandscape ? previewSize.width : previewSize.height;
+            isPortraitSensor ? previewSize.height : previewSize.width;
         final double videoHeight =
-            isLandscape ? previewSize.height : previewSize.width;
+            isPortraitSensor ? previewSize.width : previewSize.height;
 
         // Apply BoxFit.cover (which is what CameraPreview normally does if constrained)
         // Wait, CameraPreview is typically wrapped in a Center without constraints, which acts as BoxFit.contain 

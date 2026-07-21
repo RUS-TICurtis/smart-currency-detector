@@ -68,7 +68,7 @@ class AIModelService {
   Interpreter? _interpreter;
   List<String>? _labels;
 
-  static const String _modelPath = 'assets/model/best_int8.tflite';
+  static const String _modelPath = 'assets/model/best.tflite';
   static const String _labelPath = 'assets/model/labels.txt';
 
   /// Input spatial dimension expected by the YOLOv11 model (640 × 640).
@@ -87,12 +87,12 @@ class AIModelService {
   int _frameCount = 0;
 
   // ── Tensor type / quantization metadata (populated in initModel) ──
-  TensorType _inputType  = TensorType.float32;
+  TensorType _inputType = TensorType.float32;
   TensorType _outputType = TensorType.float32;
-  double _inputScale   = 1.0;
-  int    _inputZeroPoint  = 0;
-  double _outputScale  = 1.0;
-  int    _outputZeroPoint = 0;
+  double _inputScale = 1.0;
+  int _inputZeroPoint = 0;
+  double _outputScale = 1.0;
+  int _outputZeroPoint = 0;
 
   // ---------------------------------------------------------------------------
   // Initialisation
@@ -103,25 +103,33 @@ class AIModelService {
   Future<void> initModel() async {
     final options = InterpreterOptions();
 
-    // ── GPU / NPU acceleration (best-effort; falls back to CPU) ──
-    // tflite_flutter exposes delegates via the options.useNnApiForAndroid
-    // shorthand and the GpuDelegateV2 helper.  Both are wrapped in try/catch
-    // because delegate availability depends on device and OS version.
-    //
-    // NOTE: NNAPI INT8 support is patchy on Android < 10 and some OEM devices.
-    // We detect the output type after loading and disable NNAPI for INT8 models
-    // to avoid silent all-zero output or native crashes on unsupported hardware.
+    // ── BUG-04 FIX: Add hardware delegates BEFORE creating the interpreter. ──
+    // OEM devices. CPU INT8 is the safe, consistent default for Android.
+    try {
+      if (Platform.isAndroid) {
+        // Use CPU thread=1 to prevent "Input tensor lacks data" crashes in YOLO exports
+        options.threads = 1;
+        debugPrint('AIModelService: Android — running CPU INT8 for reliability.');
+      } else if (Platform.isIOS) {
+        options.addDelegate(GpuDelegateV2());
+        debugPrint('AIModelService: Metal/GPU delegate added (iOS).');
+      }
+    } catch (e) {
+      debugPrint('AIModelService: delegate setup failed, using CPU. ($e)');
+    }
+
     _interpreter = await Interpreter.fromAsset(_modelPath, options: options);
 
     // ── Capture tensor types and quantization params ──
-    final inTensor  = _interpreter!.getInputTensor(0);
+    final inTensor = _interpreter!.getInputTensor(0);
     final outTensor = _interpreter!.getOutputTensor(0);
+    debugPrint('AIModelService Input: shape=${inTensor.shape}, type=${inTensor.type}, total_inputs=${_interpreter!.getInputTensors().length}');
 
-    _inputType       = inTensor.type;
-    _outputType      = outTensor.type;
-    _inputScale      = inTensor.params.scale;
-    _inputZeroPoint  = inTensor.params.zeroPoint;
-    _outputScale     = outTensor.params.scale;
+    _inputType = inTensor.type;
+    _outputType = outTensor.type;
+    _inputScale = inTensor.params.scale;
+    _inputZeroPoint = inTensor.params.zeroPoint;
+    _outputScale = outTensor.params.scale;
     _outputZeroPoint = outTensor.params.zeroPoint;
 
     debugPrint(
@@ -130,26 +138,6 @@ class AIModelService {
     debugPrint(
       'AIModelService: output type=$_outputType scale=$_outputScale zp=$_outputZeroPoint',
     );
-
-    // ── Enable hardware delegates only if safe for this quantization type ──
-    final isQuantized = _inputType != TensorType.float32 ||
-                        _outputType != TensorType.float32;
-    try {
-      if (Platform.isAndroid && !isQuantized) {
-        // NNAPI is reliable for float32 models; skip for INT8 to avoid OEM issues.
-        options.useNnApiForAndroid = true;
-        debugPrint('AIModelService: NNAPI delegate enabled (float32 model).');
-      } else if (Platform.isIOS) {
-        options.addDelegate(GpuDelegateV2());
-        debugPrint('AIModelService: Metal/GPU delegate enabled.');
-      } else if (isQuantized) {
-        debugPrint(
-          'AIModelService: INT8/UINT8 model detected — using CPU for reliability.',
-        );
-      }
-    } catch (e) {
-      debugPrint('AIModelService: delegate unavailable, using CPU. ($e)');
-    }
 
     final rawLabels = await rootBundle.loadString(_labelPath);
     _labels = rawLabels
@@ -185,16 +173,38 @@ class AIModelService {
   // ---------------------------------------------------------------------------
 
   /// Run inference on a still image at [imagePath] (gallery / takePicture).
-  Future<List<RecognizedObject>?> predict(String imagePath, double confidenceThreshold) async {
+  Future<List<RecognizedObject>?> predict(
+    String imagePath,
+    double confidenceThreshold,
+  ) async {
     if (!_isReady) return null;
     try {
       // Preprocessing is CPU-heavy — offload to a background isolate.
       // Float32List is a TypedData and transfers efficiently across isolates.
-      final input = await Isolate.run(
+      final isolateInput = await Isolate.run(
         () => _preprocessImageToFloat32(imagePath, inputSize),
       );
-      if (input == null) return null;
-      return _runInference(input, confidenceThreshold);
+      if (isolateInput == null) return null;
+      
+      // Deep copy to break Isolate TransferableTypedData memory linkage
+      final input = Float32List.fromList(isolateInput);
+      // Create a clean, temporary Interpreter to avoid any corrupted state or 
+      // concurrent memory issues with the Auto-scan interpreter.
+      final options = InterpreterOptions();
+      if (Platform.isAndroid) {
+        options.threads = 1;
+        options.useNnApiForAndroid = true;
+      } else if (Platform.isIOS) {
+        options.addDelegate(GpuDelegate());
+      }
+      final tempInterpreter = await Interpreter.fromAsset(
+        _modelPath,
+        options: options,
+      );
+
+      final results = _runInference(tempInterpreter, input, confidenceThreshold);
+      tempInterpreter.close();
+      return results;
     } catch (e) {
       debugPrint('AIModelService: gallery inference error: $e');
       return null;
@@ -231,7 +241,7 @@ class AIModelService {
         () => _preprocessCameraImageToFloat32(isolateData, inputSize),
       );
       if (input == null) return null;
-      return _runInference(input, confidenceThreshold);
+      return _runInference(_interpreter!, input, confidenceThreshold);
     } catch (e) {
       debugPrint('AIModelService: camera inference error: $e');
       return null;
@@ -249,52 +259,68 @@ class AIModelService {
   /// 0.10.4 writes each leaf row to offset 0 of the tensor buffer, leaving
   /// only the last row in memory — producing the native error
   /// "Input tensor N lacks data / failed precondition".
-  List<RecognizedObject>? _runInference(Float32List flatInput, double confidenceThreshold) {
+  List<RecognizedObject>? _runInference(
+    Interpreter interpreter,
+    Float32List flatInput,
+    double confidenceThreshold,
+  ) {
     _frameCount++;
     final bool logThisFrame = (_frameCount % 60) == 0;
 
-    final inputTensor  = _interpreter!.getInputTensor(0);
-    final outputTensor = _interpreter!.getOutputTensor(0);
+    final inputTensor = interpreter.getInputTensor(0);
+    final outputTensor = interpreter.getOutputTensor(0);
 
     final outputShape = outputTensor.shape;
-    // YOLOv11 raw output: [1, 4+numClasses, numAnchors]
-    final int numRows    = outputShape[1];
-    final int numAnchors = outputShape[2];
-    final int numClasses = numRows - 4;
+    // YOLOv11 raw output can be NCHW [1, 4+numClasses, numAnchors]
+    // or TFLite NHWC permuted [1, numAnchors, 4+numClasses].
+    final bool isNhwc = outputShape[1] > outputShape[2];
+    final int numAnchors = isNhwc ? outputShape[1] : outputShape[2];
+    final int numFeatures = isNhwc ? outputShape[2] : outputShape[1];
+    final int numClasses = numFeatures - 4;
 
     // ── Set input via raw bytes ─────────────────────────────────────────────
     // setTo(Uint8List) writes the entire buffer atomically — safe for any size.
     if (_inputType == TensorType.int8 || _inputType == TensorType.uint8) {
       // Full integer quantization: float → int8 / uint8
       final isUint8 = _inputType == TensorType.uint8;
-      final qMin = isUint8 ?   0 : -128;
-      final qMax = isUint8 ? 255 :  127;
+      final qMin = isUint8 ? 0 : -128;
+      final qMax = isUint8 ? 255 : 127;
       if (isUint8) {
         final quantized = Uint8List(flatInput.length);
         for (int i = 0; i < flatInput.length; i++) {
-          quantized[i] = ((flatInput[i] / _inputScale).round() + _inputZeroPoint)
-              .clamp(qMin, qMax);
+          quantized[i] =
+              ((flatInput[i] / _inputScale).round() + _inputZeroPoint).clamp(
+                qMin,
+                qMax,
+              );
         }
         inputTensor.setTo(quantized);
       } else {
         final quantized = Int8List(flatInput.length);
         for (int i = 0; i < flatInput.length; i++) {
-          quantized[i] = ((flatInput[i] / _inputScale).round() + _inputZeroPoint)
-              .clamp(qMin, qMax);
+          quantized[i] =
+              ((flatInput[i] / _inputScale).round() + _inputZeroPoint).clamp(
+                qMin,
+                qMax,
+              );
         }
-        inputTensor.setTo(quantized.buffer.asUint8List());
+        inputTensor.setTo(Uint8List.sublistView(quantized));
       }
     } else {
       // float32 / dynamic-range-quant — copy raw bytes directly
-      inputTensor.setTo(flatInput.buffer.asUint8List());
+      // Use sublistView to safely handle Isolate-transferred TypedData offsets
+      inputTensor.setTo(Uint8List.sublistView(flatInput));
     }
 
     // ── Invoke ──────────────────────────────────────────────────────────────
-    _interpreter!.invoke();
+    interpreter.invoke();
 
     // ── Read output via raw bytes ────────────────────────────────────────────
     final outRawBytes = outputTensor.data; // Uint8List
-    final outInt8Bytes = outRawBytes.buffer.asInt8List(outRawBytes.offsetInBytes, outRawBytes.lengthInBytes);
+    final outInt8Bytes = outRawBytes.buffer.asInt8List(
+      outRawBytes.offsetInBytes,
+      outRawBytes.lengthInBytes,
+    );
 
     // ── 1. Parse raw anchors into candidate detections ──────────────────────
     final detections = <RecognizedObject>[];
@@ -307,27 +333,44 @@ class AIModelService {
         double maxScore = 0.0;
         int bestClass = -1;
         for (int c = 0; c < numClasses; c++) {
-          final idx = (4 + c) * numAnchors + a;
+          final idx = isNhwc
+              ? (a * numFeatures + (4 + c))
+              : ((4 + c) * numAnchors + a);
           final raw = isUint8 ? outRawBytes[idx] : outInt8Bytes[idx];
           final score = (raw - _outputZeroPoint) * _outputScale;
-          if (score > maxScore) { maxScore = score; bestClass = c; }
+          if (score > maxScore) {
+            maxScore = score;
+            bestClass = c;
+          }
         }
 
         if (maxScore > topRawScore) topRawScore = maxScore;
         if (maxScore < confidenceThreshold) continue;
         if (bestClass < 0 || bestClass >= (_labels?.length ?? 0)) continue;
 
-        double deq(int row) {
-          final idx = row * numAnchors + a;
+        double deq(int featureIdx) {
+          final idx = isNhwc
+              ? (a * numFeatures + featureIdx)
+              : (featureIdx * numAnchors + a);
           final raw = isUint8 ? outRawBytes[idx] : outInt8Bytes[idx];
           return (raw - _outputZeroPoint) * _outputScale;
         }
-        final cx = deq(0); final cy = deq(1);
-        final bw = deq(2); final bh = deq(3);
-        detections.add(RecognizedObject(
-          bestClass, _labels![bestClass], maxScore,
-          cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2,
-        ));
+
+        final cx = deq(0);
+        final cy = deq(1);
+        final bw = deq(2);
+        final bh = deq(3);
+        detections.add(
+          RecognizedObject(
+            bestClass,
+            _labels![bestClass],
+            maxScore,
+            cx - bw / 2,
+            cy - bh / 2,
+            cx + bw / 2,
+            cy + bh / 2,
+          ),
+        );
       }
     } else {
       // float32 output — view the byte buffer as a flat Float32List
@@ -340,22 +383,41 @@ class AIModelService {
         double maxScore = 0.0;
         int bestClass = -1;
         for (int c = 0; c < numClasses; c++) {
-          final score = outF32[(4 + c) * numAnchors + a];
-          if (score > maxScore) { maxScore = score; bestClass = c; }
+          final idx = isNhwc
+              ? (a * numFeatures + (4 + c))
+              : ((4 + c) * numAnchors + a);
+          final score = outF32[idx];
+          if (score > maxScore) {
+            maxScore = score;
+            bestClass = c;
+          }
         }
 
         if (maxScore > topRawScore) topRawScore = maxScore;
         if (maxScore < confidenceThreshold) continue;
         if (bestClass < 0 || bestClass >= (_labels?.length ?? 0)) continue;
 
-        final cx = outF32[0 * numAnchors + a];
-        final cy = outF32[1 * numAnchors + a];
-        final bw = outF32[2 * numAnchors + a];
-        final bh = outF32[3 * numAnchors + a];
-        detections.add(RecognizedObject(
-          bestClass, _labels![bestClass], maxScore,
-          cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2,
-        ));
+        double f32(int featureIdx) {
+          return outF32[isNhwc
+              ? (a * numFeatures + featureIdx)
+              : (featureIdx * numAnchors + a)];
+        }
+
+        final cx = f32(0);
+        final cy = f32(1);
+        final bw = f32(2);
+        final bh = f32(3);
+        detections.add(
+          RecognizedObject(
+            bestClass,
+            _labels![bestClass],
+            maxScore,
+            cx - bw / 2,
+            cy - bh / 2,
+            cx + bw / 2,
+            cy + bh / 2,
+          ),
+        );
       }
     }
 
@@ -369,6 +431,7 @@ class AIModelService {
       );
     }
 
+    debugPrint('AIModelService: Top score = $topRawScore, found ${detections.length} pre-NMS');
     if (detections.isEmpty) return null;
 
     // ── 2. Apply Non-Maximum Suppression ──
@@ -391,7 +454,7 @@ class AIModelService {
   ) {
     // Sort descending by confidence so higher-quality boxes win.
     detections.sort((a, b) => b.confidence.compareTo(a.confidence));
-    
+
     // Cap at top 100 to prevent O(N^2) explosion
     if (detections.length > 100) {
       detections = detections.sublist(0, 100);
@@ -494,18 +557,22 @@ class AIModelService {
     final dx = (inputSize - targetW) ~/ 2;
     final dy = (inputSize - targetH) ~/ 2;
 
-    // Allocate the flat CHW buffer
+    // Allocate the flat HWC buffer (NHWC layout: [R,G,B interleaved per pixel])
     final buffer = Float32List(3 * inputSize * inputSize)
       ..fillRange(0, 3 * inputSize * inputSize, _letterboxFill);
 
     final isYUV = data.formatGroup == 'yuv420';
     final p0 = data.planes[0];
     final p1 = data.planes.length > 1 ? data.planes[1] : p0;
-    final p2 = data.planes.length > 2 ? data.planes[2] : p0;
+    // BUG-06 FIX: Fall back to p1 (chroma) rather than p0 (luma) when fewer
+    // than 3 planes are reported. In NV21/NV12 semi-planar format planes[1] and
+    // planes[2] reference the same interleaved UV buffer with a 1-byte offset,
+    // so p1 is always a better chroma substitute than the Y plane (p0).
+    final p2 = data.planes.length > 2 ? data.planes[2] : p1;
 
     for (int y = 0; y < targetH; y++) {
       final effY = (y / scale).floor().clamp(0, effHeight - 1);
-      
+
       for (int x = 0; x < targetW; x++) {
         final effX = (x / scale).floor().clamp(0, effWidth - 1);
 
@@ -536,12 +603,19 @@ class AIModelService {
           final yIndex = srcY * p0.bytesPerRow + srcX;
           final uvX = srcX ~/ 2;
           final uvY = srcY ~/ 2;
-          final uIndex = uvY * p1.bytesPerRow + uvX * p1.bytesPerPixel;
-          final vIndex = uvY * p2.bytesPerRow + uvX * p2.bytesPerPixel;
 
+          final uIndex = uvY * p1.bytesPerRow + uvX * p1.bytesPerPixel;
           final yVal = p0.bytes[yIndex];
           final uVal = p1.bytes[uIndex];
-          final vVal = p2.bytes[vIndex];
+
+          int vVal;
+          if (data.planes.length > 2) {
+            final vIndex = uvY * p2.bytesPerRow + uvX * p2.bytesPerPixel;
+            vVal = p2.bytes[vIndex];
+          } else {
+            // If only 2 planes exist, UV are interleaved in p1. The next byte is V.
+            vVal = (uIndex + 1 < p1.bytes.length) ? p1.bytes[uIndex + 1] : uVal;
+          }
 
           final c = yVal - 16;
           final d = uVal - 128;
@@ -560,11 +634,11 @@ class AIModelService {
 
         final outY = y + dy;
         final outX = x + dx;
+        // CHW planar layout matching PyTorch native export [1,3,640,640]
         final base = outY * inputSize + outX;
-        
-        buffer[0 * inputSize * inputSize + base] = r;
-        buffer[1 * inputSize * inputSize + base] = g;
-        buffer[2 * inputSize * inputSize + base] = b;
+        buffer[0 * inputSize * inputSize + base] = r; // R
+        buffer[1 * inputSize * inputSize + base] = g; // G
+        buffer[2 * inputSize * inputSize + base] = b; // B
       }
     }
 
@@ -593,7 +667,7 @@ class AIModelService {
     final dx = (inputSize - targetW) ~/ 2;
     final dy = (inputSize - targetH) ~/ 2;
 
-    // Allocate the flat CHW buffer and pre-fill with letterbox grey.
+    // Allocate the flat HWC buffer (NHWC layout: [R,G,B interleaved per pixel])
     final buffer = Float32List(3 * inputSize * inputSize)
       ..fillRange(0, 3 * inputSize * inputSize, _letterboxFill);
 
@@ -603,6 +677,7 @@ class AIModelService {
         final pixel = resized.getPixel(x, y);
         final outY = y + dy;
         final outX = x + dx;
+        // CHW planar layout matching PyTorch native export [1,3,640,640]
         final base = outY * inputSize + outX;
         buffer[0 * inputSize * inputSize + base] = pixel.r / 255.0; // R
         buffer[1 * inputSize * inputSize + base] = pixel.g / 255.0; // G

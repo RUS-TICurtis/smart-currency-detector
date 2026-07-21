@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'dart:ui';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
@@ -57,20 +58,22 @@ class CameraScreen extends HookConsumerWidget {
     final sessionState = ref.watch(sessionProvider);
 
     // ── Local state ──
-    final scanStatus = useState('Loading model...');
+    final scanStatus = useState<String>('Starting camera...');
+    final snapshotBytes = useState<Uint8List?>(null);
     final isProcessing = useState(false);
     final isFlashOn = useState(false);
     final appResumedTick = useState(0);
 
-    // FIX (H-04): Track mount state via a ValueNotifier so async callbacks
-    // can safely check before calling setState on a disposed widget.
-    // useIsMounted() is deprecated on Flutter 3.7+; we use a manual
-    // WidgetsBinding post-frame guard instead.
-    bool disposed = false;
+    // BUG-08 FIX: Use useRef<bool> so the disposed flag persists across
+    // rebuilds. A plain local 'bool disposed' creates a NEW instance on
+    // every build() call — the useEffect cleanup sets the OLD copy to true,
+    // but callbacks on the new build check the NEW copy (always false),
+    // allowing post-dispose code to run and causing setState-on-disposed errors.
+    final disposed = useRef(false);
     useEffect(() {
-      return () { disposed = true; };
+      return () { disposed.value = true; };
     }, const []);
-    bool isMounted() => !disposed;
+    bool isMounted() => !disposed.value;
 
     // Internal refs — mutations don't need to trigger a rebuild.
     final latestImage = useRef<CameraImage?>(null);
@@ -78,7 +81,11 @@ class CameraScreen extends HookConsumerWidget {
     
     // Aggregation history for multi-note detection.
     final detectionHistory = useRef<List<Map<GhanaCedi, int>>>([]);
-    final lastSpokenText = useRef<String>('');
+    // BUG-09 FIX: Tracks consecutive 5-frame windows that returned no stable
+    // detection. resetScannerTracking() is only called after 3 consecutive
+    // empty windows (~3 seconds), preventing a brief note repositioning from
+    // clearing the cooldown guard and triggering a double-count.
+    final consecutiveEmptyWindows = useRef(0);
     
     // Notifier to instantly update the bounding box overlay without full rebuilds.
     final currentDetections = useValueNotifier<List<RecognizedObject>>([]);
@@ -196,7 +203,16 @@ class CameraScreen extends HookConsumerWidget {
               if (prediction != null && prediction.isNotEmpty) {
                 currentDetections.value = prediction;
               } else {
-                currentDetections.value = [];
+                // Anti-flicker: Only clear bounding boxes if the previous 2 frames were also empty
+                // (3 empty frames total = 600ms grace period)
+                int emptyCount = 0;
+                for (int i = history.length - 1; i >= 0; i--) {
+                  if (history[i].isEmpty) emptyCount++;
+                  else break;
+                }
+                if (emptyCount >= 2) {
+                  currentDetections.value = [];
+                }
               }
 
               // ── 2. Sliding window Median Consensus ──
@@ -224,6 +240,8 @@ class CameraScreen extends HookConsumerWidget {
 
                 // ── 3. Process with SessionProvider ──
                 if (stableCounts.isNotEmpty) {
+                  // Camera is actively seeing stable notes — reset the empty-window counter.
+                  consecutiveEmptyWindows.value = 0;
                   final addedValue = ref.read(sessionProvider.notifier).processDetection(stableCounts);
                   
                   if (addedValue > 0) {
@@ -232,17 +250,26 @@ class CameraScreen extends HookConsumerWidget {
                     final summary = 'Added ${addedValue.toStringAsFixed(0)} Cedis. Total is now ${total.toStringAsFixed(0)} Cedis.';
                     ref.read(speechServiceProvider).speak(summary);
                     scanStatus.value = 'Added GHS ${addedValue.toStringAsFixed(2)}\nTotal: GHS ${total.toStringAsFixed(2)}';
-                    lastSpokenText.value = summary;
                   } else {
                     // It's stable but ignored due to cooldown.
-                    if (scanStatus.value != 'Note already scanned') {
+                    // Prevent overwriting the 'Added GHS...' success message immediately.
+                    if (!scanStatus.value.startsWith('Added GHS') && scanStatus.value != 'Note already scanned') {
                        Haptics.vibrate(HapticsType.light);
                        scanStatus.value = 'Note already scanned';
                     }
                   }
                 } else {
-                  scanStatus.value = 'Could not detect note';
-                  ref.read(sessionProvider.notifier).resetScannerTracking();
+                  // No stable detection this window. Only reset the duplicate guard
+                  // after 15 consecutive empty windows (15 * 200ms = 3 seconds), so a momentary
+                  // note repositioning doesn't allow an immediate double-count.
+                  consecutiveEmptyWindows.value++;
+                  if (consecutiveEmptyWindows.value >= 15) {
+                    ref.read(sessionProvider.notifier).resetScannerTracking();
+                    consecutiveEmptyWindows.value = 0;
+                    scanStatus.value = 'Could not detect note';
+                  } else if (scanStatus.value.startsWith('Verifying') || scanStatus.value == 'Ready to scan') {
+                    scanStatus.value = 'Searching for notes...';
+                  }
                 }
               } else {
                 scanStatus.value = 'Verifying... (${history.length}/5)';
@@ -301,6 +328,13 @@ class CameraScreen extends HookConsumerWidget {
                     color: Colors.black,
                     child: Center(child: RepaintBoundary(child: CameraPreview(controller))),
                   ),
+                  if (!settings.autoScan && snapshotBytes.value != null)
+                    Positioned.fill(
+                      child: Image.memory(
+                        snapshotBytes.value!,
+                        fit: BoxFit.cover,
+                      ),
+                    ),
                   RepaintBoundary(
                     child: ValueListenableBuilder<List<RecognizedObject>>(
                       valueListenable: currentDetections,
@@ -537,6 +571,8 @@ class CameraScreen extends HookConsumerWidget {
                                             if (!isMounted()) return;
                                             isProcessing.value = true;
                                             scanStatus.value = 'Scanning note...';
+                                            currentDetections.value = [];
+                                            snapshotBytes.value = null;
 
                                             final speechService = ref
                                                 .read(speechServiceProvider);
@@ -572,10 +608,15 @@ class CameraScreen extends HookConsumerWidget {
                                                 );
                                               } else {
                                                 // Take a still picture.
-                                                final xFile = await controller
-                                                    .takePicture();
-                                                prediction = await aiService
-                                                    .predict(
+                                                final xFile = await controller.takePicture();
+                                                
+                                                // Read bytes for preview
+                                                final bytes = await xFile.readAsBytes();
+                                                if (isMounted()) {
+                                                  snapshotBytes.value = bytes;
+                                                }
+
+                                                prediction = await aiService.predict(
                                                   xFile.path,
                                                   settings.confidenceThreshold,
                                                 );
@@ -626,6 +667,7 @@ class CameraScreen extends HookConsumerWidget {
                                             } finally {
                                               if (isMounted()) {
                                                 isProcessing.value = false;
+                                                snapshotBytes.value = null;
                                               }
                                             }
                                           },

@@ -3,10 +3,11 @@ import '../models/ghana_cedi_denomination.dart';
 import 'ai_model_service.dart';
 
 class CurrencyValidator {
-  /// The maximum number of identical notes we reasonably expect to see in a single frame.
-  /// If the model hallucinates 15 bounding boxes around a single note, this will cap it,
-  /// preventing mathematically impossible totals like "1500 Cedis" from a single 100 note.
-  static const int maxNotesPerDenomination = 4;
+  /// Maximum note duplicates per denomination per frame (prevents hallucinated stacks).
+  static const int maxNotesPerDetection = 5;
+
+  /// Maximum coin duplicates per denomination per frame (coins are smaller, more can be visible).
+  static const int maxCoinsPerDetection = 15;
 
   /// Validates a list of raw predictions from the AI model.
   /// Converts them into a sanitized map of [GhanaCedi] to their validated counts.
@@ -23,9 +24,9 @@ class CurrencyValidator {
 
       final currentCount = validatedCounts[denomination] ?? 0;
       
-      // Coins are physically smaller, so we can reasonably expect up to 15 in a single frame.
-      // Notes are larger, so we cap them at 5 to prevent duplicate bounding box hallucinations.
-      final maxAllowed = denomination.value < 1.0 ? 15 : 5;
+      // Coins are physically smaller; we cap them at maxCoinsPerDetection.
+      // Notes are larger; cap at maxNotesPerDetection to prevent hallucinated duplicates.
+      final maxAllowed = denomination.value < 1.0 ? maxCoinsPerDetection : maxNotesPerDetection;
 
       if (currentCount < maxAllowed) {
         validatedCounts[denomination] = currentCount + 1;
