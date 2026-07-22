@@ -15,6 +15,7 @@ import '../../../core/services/ai_model_service.dart';
 import '../../../core/models/ghana_cedi_denomination.dart';
 import '../../../core/services/currency_validator.dart';
 import '../speech/providers/speech_provider.dart';
+import '../speech/providers/voice_guidance_provider.dart';
 import '../settings/providers/settings_provider.dart';
 import '../detection/providers/session_provider.dart';
 import '../detection/widgets/summation_bottom_sheet.dart';
@@ -55,6 +56,13 @@ class CameraScreen extends HookConsumerWidget {
     final cameraState = ref.watch(cameraControllerProvider);
     final aiState = ref.watch(aiServiceProvider); // FutureProvider<AIModelService>
     final settings = ref.watch(settingsProvider);
+    final voiceGuidance = ref.watch(voiceGuidanceProvider);
+
+    // Play orientation on initial launch
+    useEffect(() {
+      voiceGuidance.playOrientation();
+      return null;
+    }, const []);
 
     // ── Local state ──
     final scanStatus = useState<String>('Starting camera...');
@@ -248,11 +256,8 @@ class CameraScreen extends HookConsumerWidget {
                   if (addedItems.isNotEmpty) {
                     Haptics.vibrate(HapticsType.success);
                     final firstItem = addedItems.first;
-                    final spokenVal = firstItem.spokenValue;
-                    final announcement = '$spokenVal detected. Scan again to add another currency.';
-
-                    ref.read(speechServiceProvider).speak(announcement);
-                    scanStatus.value = '$spokenVal detected.\nScan again to add another.';
+                    voiceGuidance.announceScanSuccess(firstItem.spokenValue);
+                    scanStatus.value = '${firstItem.spokenValue} detected.\nScan again to add another.';
                   }
                 } else {
                   consecutiveEmptyWindows.value++;
@@ -531,22 +536,31 @@ class CameraScreen extends HookConsumerWidget {
                                     ? null
                                     : () {
                                         final removed = ref.read(sessionProvider.notifier).removeLastItem();
+                                        final session = ref.read(sessionProvider);
+                                        final isNowEmpty = session.items.isEmpty;
+                                        final spokenNewTotal = GhanaCedi.formatSpokenTotal(session.totalValue);
+                                        
+                                        voiceGuidance.announceItemRemoved(
+                                          removed?.spokenValue,
+                                          spokenNewTotal,
+                                          isNowEmpty,
+                                        );
+                                        
                                         if (removed != null) {
                                           Haptics.vibrate(HapticsType.selection);
-                                          final spokenVal = removed.spokenValue;
-                                          ref.read(speechServiceProvider).speak('Removed $spokenVal.');
-                                          scanStatus.value = 'Removed $spokenVal';
+                                          scanStatus.value = 'Removed ${removed.spokenValue}';
                                         } else {
-                                          ref.read(speechServiceProvider).speak('Nothing to remove.');
                                           scanStatus.value = 'Nothing to remove.';
                                         }
                                       },
                                 onLongPress: isProcessing.value
                                     ? null
-                                    : () {
+                                    : () async {
+                                        await voiceGuidance.announceSessionCleared(true);
                                         ref.read(sessionProvider.notifier).clearSession();
+                                        voiceGuidance.resetSession();
                                         Haptics.vibrate(HapticsType.medium);
-                                        ref.read(speechServiceProvider).speak('Session cleared.');
+                                        await voiceGuidance.announceSessionCleared(false);
                                         scanStatus.value = 'Session cleared';
                                       },
                                 style: OutlinedButton.styleFrom(
@@ -581,13 +595,13 @@ class CameraScreen extends HookConsumerWidget {
                               child: ElevatedButton(
                                 onPressed: () {
                                   final session = ref.read(sessionProvider);
+                                  final spokenTotal = GhanaCedi.formatSpokenTotal(session.totalValue);
+                                  voiceGuidance.announceSum(session.items.length, spokenTotal);
+                                  
                                   if (session.items.isEmpty) {
-                                    ref.read(speechServiceProvider).speak('No currency currently stored.');
                                     scanStatus.value = 'No currency stored';
                                   } else {
                                     Haptics.vibrate(HapticsType.medium);
-                                    final spokenTotal = GhanaCedi.formatSpokenTotal(session.totalValue);
-                                    ref.read(speechServiceProvider).speak('Total value is $spokenTotal.');
                                     scanStatus.value = 'Total: GHS ${session.totalValue.toStringAsFixed(2)}';
                                   }
                                 },
@@ -669,18 +683,15 @@ class CameraScreen extends HookConsumerWidget {
                                               Haptics.vibrate(HapticsType.success);
 
                                               final firstItem = addedItems.first;
-                                              final spokenVal = firstItem.spokenValue;
-                                              final announcement = '$spokenVal detected. Scan again to add another currency.';
-
-                                              scanStatus.value = '$spokenVal detected.\nScan again to add another currency.';
-                                              await speechService.speak(announcement);
+                                              voiceGuidance.announceScanSuccess(firstItem.spokenValue);
+                                              scanStatus.value = '${firstItem.spokenValue} detected.\nScan again to add another currency.';
                                             } else {
                                               scanStatus.value = 'Could not detect valid currency.';
-                                              await speechService.speak('Could not clearly detect valid currency. Scan again.');
+                                              await voiceGuidance.announceScanFailure();
                                             }
                                           } else {
                                             scanStatus.value = 'Could not detect currency.';
-                                            await speechService.speak('Could not clearly detect currency. Scan again.');
+                                            await voiceGuidance.announceScanFailure();
                                           }
                                         } catch (e) {
                                           if (!isMounted()) return;
