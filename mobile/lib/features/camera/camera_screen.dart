@@ -55,7 +55,6 @@ class CameraScreen extends HookConsumerWidget {
     final cameraState = ref.watch(cameraControllerProvider);
     final aiState = ref.watch(aiServiceProvider); // FutureProvider<AIModelService>
     final settings = ref.watch(settingsProvider);
-    final sessionState = ref.watch(sessionProvider);
 
     // ── Local state ──
     final scanStatus = useState<String>('Starting camera...');
@@ -243,39 +242,21 @@ class CameraScreen extends HookConsumerWidget {
 
                 // ── 3. Process with SessionProvider ──
                 if (stableCounts.isNotEmpty) {
-                  // Camera is actively seeing stable items — reset the empty-window counter.
                   consecutiveEmptyWindows.value = 0;
-                  final addedValue = ref.read(sessionProvider.notifier).processDetection(stableCounts);
+                  final addedItems = ref.read(sessionProvider.notifier).addDetections(stableCounts);
                   
-                  if (addedValue > 0) {
+                  if (addedItems.isNotEmpty) {
                     Haptics.vibrate(HapticsType.success);
-                    final total = ref.read(sessionProvider).totalValue;
-                    final parts = <String>[];
-                    stableCounts.forEach((denomination, count) {
-                      final unit = denomination.isCoin ? 'coin' : 'note';
-                      final plural = count > 1 ? '${unit}s' : unit;
-                      if (denomination.value < 1.0) {
-                        parts.add('$count, ${(denomination.value * 100).toInt()} Pesewas $plural');
-                      } else {
-                        parts.add('$count, ${denomination.value.toInt()} Cedi $plural');
-                      }
-                    });
+                    final firstItem = addedItems.first;
+                    final spokenVal = firstItem.spokenValue;
+                    final announcement = '$spokenVal detected. Scan again to add another currency.';
 
-                    final summary = 'Added ${parts.join(', ')}. Total is now ${total.toStringAsFixed(0)} Cedis.';
-                    ref.read(speechServiceProvider).speak(summary);
-                    scanStatus.value = 'Added ${parts.join(', ')}\nTotal: GHS ${total.toStringAsFixed(2)}';
-                  } else {
-                    // It's stable but already tracked in the current view.
-                    if (!scanStatus.value.startsWith('Added') && scanStatus.value != 'Currency already scanned') {
-                       Haptics.vibrate(HapticsType.light);
-                       scanStatus.value = 'Currency already scanned';
-                    }
+                    ref.read(speechServiceProvider).speak(announcement);
+                    scanStatus.value = '$spokenVal detected.\nScan again to add another.';
                   }
                 } else {
-                  // No stable detection this window. Reset tracking lock after 15 consecutive empty windows (~3 seconds)
                   consecutiveEmptyWindows.value++;
                   if (consecutiveEmptyWindows.value >= 15) {
-                    ref.read(sessionProvider.notifier).resetScannerTracking();
                     consecutiveEmptyWindows.value = 0;
                     scanStatus.value = 'Searching for currency...';
                   } else if (scanStatus.value.startsWith('Verifying') || scanStatus.value == 'Ready to scan') {
@@ -539,148 +520,202 @@ class CameraScreen extends HookConsumerWidget {
 
                       // Action buttons
                       Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
-                          // ── SUMMATION BUTTON ──
+                          // ── 1. CLEAR BUTTON ──
                           Expanded(
                             child: SizedBox(
-                              height: 72,
-                              child: ElevatedButton.icon(
-                                onPressed: () {
-                                  showModalBottomSheet(
-                                    context: context,
-                                    isScrollControlled: true,
-                                    backgroundColor: Colors.transparent,
-                                    builder: (context) => const SummationBottomSheet(),
-                                  );
-                                },
-                                icon: const Icon(Icons.receipt_long, size: 28),
-                                label: Text(
-                                  'GHS ${sessionState.totalValue.toStringAsFixed(2)}',
-                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                              height: 104,
+                              child: OutlinedButton(
+                                onPressed: isProcessing.value
+                                    ? null
+                                    : () {
+                                        final removed = ref.read(sessionProvider.notifier).removeLastItem();
+                                        if (removed != null) {
+                                          Haptics.vibrate(HapticsType.selection);
+                                          final spokenVal = removed.spokenValue;
+                                          ref.read(speechServiceProvider).speak('Removed $spokenVal.');
+                                          scanStatus.value = 'Removed $spokenVal';
+                                        } else {
+                                          ref.read(speechServiceProvider).speak('Nothing to remove.');
+                                          scanStatus.value = 'Nothing to remove.';
+                                        }
+                                      },
+                                onLongPress: isProcessing.value
+                                    ? null
+                                    : () {
+                                        ref.read(sessionProvider.notifier).clearSession();
+                                        Haptics.vibrate(HapticsType.medium);
+                                        ref.read(speechServiceProvider).speak('Session cleared.');
+                                        scanStatus.value = 'Session cleared';
+                                      },
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: theme.colorScheme.error,
+                                  side: BorderSide(color: theme.colorScheme.error),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(16),
+                                  ),
+                                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
                                 ),
+                                child: const Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.backspace, size: 28),
+                                    SizedBox(height: 8),
+                                    Text(
+                                      'Clear',
+                                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+
+                          // ── 2. SUM BUTTON ──
+                          Expanded(
+                            child: SizedBox(
+                              height: 104,
+                              child: ElevatedButton(
+                                onPressed: () {
+                                  final session = ref.read(sessionProvider);
+                                  if (session.items.isEmpty) {
+                                    ref.read(speechServiceProvider).speak('No currency currently stored.');
+                                    scanStatus.value = 'No currency stored';
+                                  } else {
+                                    Haptics.vibrate(HapticsType.medium);
+                                    final spokenTotal = GhanaCedi.formatSpokenTotal(session.totalValue);
+                                    ref.read(speechServiceProvider).speak('Total value is $spokenTotal.');
+                                    scanStatus.value = 'Total: GHS ${session.totalValue.toStringAsFixed(2)}';
+                                  }
+                                },
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: theme.colorScheme.primaryContainer,
                                   foregroundColor: theme.colorScheme.onPrimaryContainer,
                                   shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(20),
+                                    borderRadius: BorderRadius.circular(16),
                                   ),
+                                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                                ),
+                                child: const Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.functions, size: 30),
+                                    SizedBox(height: 8),
+                                    Text(
+                                      'Sum',
+                                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  ],
                                 ),
                               ),
                             ),
                           ),
-                          const SizedBox(width: 16),
+                          const SizedBox(width: 8),
 
-                          // ── SCAN NOTE ──
+                          // ── 3. SCAN BUTTON ──
                           Expanded(
                             child: SizedBox(
-                              height: 72,
-                              child: ElevatedButton.icon(
-                                onPressed:
-                                    systemBusy || isProcessing.value
-                                        ? null
-                                        : () async {
-                                            if (!isMounted()) return;
-                                            isProcessing.value = true;
-                                            scanStatus.value = 'Scanning...';
-                                            final speechService = ref.read(speechServiceProvider);
-                                            speechService.speak('Scanning. Please hold steady.');
+                              height: 104,
 
-                                            try {
-                                              final controller = cameraState.value!;
-                                              final aiService = aiState.value!;
-                                              List<RecognizedObject>? prediction;
+                              child: ElevatedButton(
+                                onPressed: systemBusy || isProcessing.value
+                                    ? null
+                                    : () async {
+                                        if (!isMounted()) return;
+                                        isProcessing.value = true;
+                                        scanStatus.value = 'Scanning...';
+                                        currentDetections.value = [];
+                                        snapshotBytes.value = null;
 
-                                              if (!isMounted()) return;
-                                              scanStatus.value = 'Analysing...';
+                                        final speechService = ref.read(speechServiceProvider);
+                                        speechService.speak('Scanning.');
 
-                                              if (settings.autoScan) {
-                                                final image = latestImage.value;
-                                                if (image == null) {
-                                                  throw Exception('No camera frame ready yet.');
-                                                }
-                                                prediction = await aiService.predictFromCameraImage(
-                                                  image,
-                                                  controller.description.sensorOrientation,
-                                                  settings.confidenceThreshold,
-                                                );
-                                              } else {
-                                                final xFile = await controller.takePicture();
-                                                final bytes = await xFile.readAsBytes();
-                                                if (isMounted()) {
-                                                  snapshotBytes.value = bytes;
-                                                }
-                                                prediction = await aiService.predict(
-                                                  xFile.path,
-                                                  settings.confidenceThreshold,
-                                                );
-                                              }
+                                        try {
+                                          final controller = cameraState.value!;
+                                          final aiService = aiState.value!;
+                                          List<RecognizedObject>? prediction;
 
-                                              if (!isMounted()) return;
-                                              if (prediction != null && prediction.isNotEmpty) {
-                                                final validatedCounts = CurrencyValidator.validateAndCapDetections(prediction);
-                                                
-                                                if (validatedCounts.isNotEmpty) {
-                                                  double totalValue = 0;
-                                                  final parts = <String>[];
-                                                  
-                                                  validatedCounts.forEach((denomination, count) {
-                                                    totalValue += denomination.value * count;
-                                                    final unit = denomination.isCoin ? 'coin' : 'note';
-                                                    final plural = count > 1 ? '${unit}s' : unit;
-                                                    if (denomination.value < 1.0) {
-                                                      parts.add('$count, ${(denomination.value * 100).toInt()} Pesewas $plural');
-                                                    } else {
-                                                      parts.add('$count, ${denomination.value.toInt()} Cedi $plural');
-                                                    }
-                                                  });
-                                                  
-                                                  final summary = '${parts.join(', ')}. Total value: ${totalValue.toStringAsFixed(2)} Ghana Cedis.';
-                                                  scanStatus.value = 'Detected:\n${parts.join('\n')}\nTotal: GHS ${totalValue.toStringAsFixed(2)}';
-                                                  await speechService.speak(summary);
-                                                } else {
-                                                  scanStatus.value = 'Could not detect valid currency.';
-                                                  await speechService.speak('Could not clearly detect valid currency.');
-                                                }
-                                              } else {
-                                                scanStatus.value = 'Could not detect currency.';
-                                                await speechService.speak(
-                                                  'Could not clearly detect currency. '
-                                                  'Please ensure the item is well lit '
-                                                  'and centred in the camera.',
-                                                );
-                                              }
-                                            } catch (e) {
-                                              if (!isMounted()) return;
-                                              scanStatus.value = 'Scan failed.';
-                                              await ref
-                                                  .read(speechServiceProvider)
-                                                  .speak(
-                                                    'An error occurred during scan.',
-                                                  );
-                                              debugPrint(
-                                                'Manual scan error: $e',
-                                              );
-                                            } finally {
-                                              if (isMounted()) {
-                                                isProcessing.value = false;
-                                                snapshotBytes.value = null;
-                                              }
+                                          if (!isMounted()) return;
+                                          scanStatus.value = 'Analysing...';
+
+                                          if (settings.autoScan && latestImage.value != null) {
+                                            prediction = await aiService.predictFromCameraImage(
+                                              latestImage.value!,
+                                              controller.description.sensorOrientation,
+                                              settings.confidenceThreshold,
+                                            );
+                                          } else {
+                                            final xFile = await controller.takePicture();
+                                            final bytes = await xFile.readAsBytes();
+                                            if (isMounted()) snapshotBytes.value = bytes;
+
+                                            prediction = await aiService.predict(
+                                              xFile.path,
+                                              settings.confidenceThreshold,
+                                            );
+                                          }
+
+                                          if (!isMounted()) return;
+
+                                          if (prediction != null && prediction.isNotEmpty) {
+                                            final validatedCounts = CurrencyValidator.validateAndCapDetections(prediction);
+                                            
+                                            if (validatedCounts.isNotEmpty) {
+                                              final addedItems = ref.read(sessionProvider.notifier).addDetections(validatedCounts);
+                                              Haptics.vibrate(HapticsType.success);
+
+                                              final firstItem = addedItems.first;
+                                              final spokenVal = firstItem.spokenValue;
+                                              final announcement = '$spokenVal detected. Scan again to add another currency.';
+
+                                              scanStatus.value = '$spokenVal detected.\nScan again to add another currency.';
+                                              await speechService.speak(announcement);
+                                            } else {
+                                              scanStatus.value = 'Could not detect valid currency.';
+                                              await speechService.speak('Could not clearly detect valid currency. Scan again.');
                                             }
-                                          },
-                                icon: const Icon(
-                                  Icons.document_scanner,
-                                  size: 28,
-                                ),
-                                label: const Text('SCAN'),
+                                          } else {
+                                            scanStatus.value = 'Could not detect currency.';
+                                            await speechService.speak('Could not clearly detect currency. Scan again.');
+                                          }
+                                        } catch (e) {
+                                          if (!isMounted()) return;
+                                          scanStatus.value = 'Scan failed.';
+                                          await speechService.speak('An error occurred during scan. Try again.');
+                                        } finally {
+                                          if (isMounted()) {
+                                            isProcessing.value = false;
+                                            snapshotBytes.value = null;
+                                          }
+                                        }
+                                      },
                                 style: ElevatedButton.styleFrom(
+                                  backgroundColor: theme.colorScheme.primary,
+                                  foregroundColor: theme.colorScheme.onPrimary,
                                   shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(20),
+                                    borderRadius: BorderRadius.circular(16),
                                   ),
+                                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                                ),
+                                child: const Column(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(Icons.document_scanner, size: 36),
+                                    SizedBox(height: 8),
+                                    Text(
+                                      'Scan',
+                                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+                                      textAlign: TextAlign.center,
+                                    ),
+                                  ],
                                 ),
                               ),
                             ),
                           ),
-
                         ],
                       ),
                     ],

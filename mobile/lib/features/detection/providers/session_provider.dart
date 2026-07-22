@@ -1,28 +1,34 @@
-import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../../core/models/ghana_cedi_denomination.dart';
-import '../../../core/models/detection_session.dart';
-import 'history_provider.dart';
 import 'package:uuid/uuid.dart';
+import '../../../core/models/detection_session.dart';
+import '../../../core/models/ghana_cedi_denomination.dart';
+import '../../../core/models/session_item.dart';
+import 'history_provider.dart';
 
-// State to hold the current session's running total and notes.
+// State to hold the current active scan session's items, total, and breakdown.
 class SessionState {
+  final List<SessionItem> items;
   final double totalValue;
   final int totalNotes;
   final Map<GhanaCedi, int> denominationCounts;
 
   const SessionState({
+    this.items = const [],
     this.totalValue = 0.0,
     this.totalNotes = 0,
     this.denominationCounts = const {},
   });
 
+  SessionItem? get lastAddedItem => items.isNotEmpty ? items.last : null;
+
   SessionState copyWith({
+    List<SessionItem>? items,
     double? totalValue,
     int? totalNotes,
     Map<GhanaCedi, int>? denominationCounts,
   }) {
     return SessionState(
+      items: items ?? this.items,
       totalValue: totalValue ?? this.totalValue,
       totalNotes: totalNotes ?? this.totalNotes,
       denominationCounts: denominationCounts ?? this.denominationCounts,
@@ -31,81 +37,75 @@ class SessionState {
 }
 
 class SessionNotifier extends Notifier<SessionState> {
-  // Tracking the last added detection to prevent duplicate spam until notes/coins exit view.
-  Map<GhanaCedi, int> _lastAddedDetection = {};
-
   @override
   SessionState build() {
     return const SessionState();
   }
 
-  /// Process stable detections from the camera.
-  /// Only adds to the running total if new notes/coins have been added
-  /// or if scanner tracking was reset (e.g. note removed from camera view).
-  /// Returns the added value if anything was added, otherwise 0.
-  double processDetection(Map<GhanaCedi, int> stableCounts) {
-    if (stableCounts.isEmpty) return 0.0;
+  /// Add detected items from a scan event into the active session stack.
+  /// Returns the newly created list of [SessionItem]s added.
+  List<SessionItem> addDetections(Map<GhanaCedi, int> counts, {double? confidence}) {
+    if (counts.isEmpty) return [];
 
-    // Check if stableCounts is higher in count or contains a new denomination
-    bool isNewDetection = false;
-    for (final entry in stableCounts.entries) {
-      final denomination = entry.key;
-      final count = entry.value;
-      final lastCount = _lastAddedDetection[denomination] ?? 0;
-      
-      if (count > lastCount) {
-        isNewDetection = true;
-        break;
-      }
-    }
+    final now = DateTime.now();
+    final newItems = <SessionItem>[];
 
-    for (final denom in stableCounts.keys) {
-      if (!_lastAddedDetection.containsKey(denom)) {
-        isNewDetection = true;
-        break;
-      }
-    }
-
-    if (!isNewDetection) {
-      // The same or a subset of the currently tracked item is still in view.
-      return 0.0;
-    }
-
-    // It's a new or additional detection. Add it to total.
-    double addedValue = 0.0;
-    int addedNotes = 0;
-    final newCounts = Map<GhanaCedi, int>.from(state.denominationCounts);
-
-    stableCounts.forEach((denomination, count) {
-      addedValue += denomination.value * count;
-      addedNotes += count;
-      newCounts[denomination] = (newCounts[denomination] ?? 0) + count;
+    counts.forEach((denomination, count) {
+      final item = SessionItem(
+        id: const Uuid().v4(),
+        denomination: denomination,
+        count: count,
+        timestamp: now,
+        confidence: confidence,
+      );
+      newItems.add(item);
     });
 
-    state = state.copyWith(
-      totalValue: state.totalValue + addedValue,
-      totalNotes: state.totalNotes + addedNotes,
-      denominationCounts: newCounts,
-    );
+    final updatedItems = List<SessionItem>.from(state.items)..addAll(newItems);
+    _recalculateState(updatedItems);
 
-    // Update tracking lock until note/coin exits camera view
-    _lastAddedDetection = Map.from(stableCounts);
-
-    return addedValue;
+    return newItems;
   }
 
-  void resetScannerTracking() {
-    // Called when camera sees no currency items for several consecutive frames.
-    _lastAddedDetection.clear();
+  /// Remove only the most recently added [SessionItem] from the active session.
+  /// Returns the removed [SessionItem] if successful, or null if the session is empty.
+  SessionItem? removeLastItem() {
+    if (state.items.isEmpty) return null;
+
+    final updatedItems = List<SessionItem>.from(state.items);
+    final removedItem = updatedItems.removeLast();
+    _recalculateState(updatedItems);
+
+    return removedItem;
   }
 
+  /// Reset the active session and clear all items.
   void clearSession() {
     state = const SessionState();
-    resetScannerTracking();
+  }
+
+  /// Internal helper to recompute total value, item counts, and denomination breakdown.
+  void _recalculateState(List<SessionItem> items) {
+    double totalVal = 0.0;
+    int totalCount = 0;
+    final Map<GhanaCedi, int> breakdown = {};
+
+    for (final item in items) {
+      totalVal += item.totalValue;
+      totalCount += item.count;
+      breakdown[item.denomination] = (breakdown[item.denomination] ?? 0) + item.count;
+    }
+
+    state = SessionState(
+      items: items,
+      totalValue: totalVal,
+      totalNotes: totalCount,
+      denominationCounts: breakdown,
+    );
   }
 
   Future<void> saveSessionToHistory() async {
-    if (state.totalNotes == 0) return;
+    if (state.items.isEmpty) return;
 
     final session = DetectionSession(
       id: const Uuid().v4(),

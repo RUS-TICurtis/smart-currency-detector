@@ -81,4 +81,88 @@ enum GhanaCedi {
     final unit = isCoin ? 'coin' : 'note';
     return '${value.toInt()} Cedi $unit';
   }
+
+  /// Formats a double value into spoken English words (e.g. 130.0 -> "One Hundred and Thirty Ghana Cedis").
+  static String formatSpokenTotal(double total) {
+    if (total <= 0) return 'Zero Ghana Cedis';
+
+    final cediPart = total.floor();
+    final pesewaPart = ((total - cediPart) * 100).round();
+
+    final parts = <String>[];
+
+    if (cediPart > 0) {
+      final words = _numberToWords(cediPart);
+      final unit = cediPart == 1 ? 'Ghana Cedi' : 'Ghana Cedis';
+      parts.add('$words $unit');
+    }
+
+    if (pesewaPart > 0) {
+      final words = _numberToWords(pesewaPart);
+      parts.add('$words Pesewas');
+    }
+
+    return parts.join(' and ');
+  }
+
+  static String _numberToWords(int number) {
+    if (number == 0) return 'Zero';
+
+    final units = [
+      '',
+      'One',
+      'Two',
+      'Three',
+      'Four',
+      'Five',
+      'Six',
+      'Seven',
+      'Eight',
+      'Nine',
+      'Ten',
+      'Eleven',
+      'Twelve',
+      'Thirteen',
+      'Fourteen',
+      'Fifteen',
+      'Sixteen',
+      'Seventeen',
+      'Eighteen',
+      'Nineteen',
+    ];
+
+    final tens = [
+      '',
+      '',
+      'Twenty',
+      'Thirty',
+      'Forty',
+      'Fifty',
+      'Sixty',
+      'Seventy',
+      'Eighty',
+      'Ninety',
+    ];
+
+    if (number < 20) {
+      return units[number];
+    }
+
+    if (number < 100) {
+      final t = number ~/ 10;
+      final u = number % 10;
+      return u == 0 ? tens[t] : '${tens[t]} ${units[u]}';
+    }
+
+    if (number < 1000) {
+      final h = number ~/ 100;
+      final rem = number % 100;
+      if (rem == 0) {
+        return '${units[h]} Hundred';
+      }
+      return '${units[h]} Hundred and ${_numberToWords(rem)}';
+    }
+
+    return number.toString();
+  }
 }

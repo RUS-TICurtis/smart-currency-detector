@@ -52,7 +52,7 @@ class SummationBottomSheet extends ConsumerWidget {
           ),
           Center(
             child: Text(
-              'Total Notes: ${sessionState.totalNotes}',
+              'Total Items: ${sessionState.totalNotes}',
               style: theme.textTheme.titleMedium?.copyWith(color: Colors.grey),
             ),
           ),
@@ -95,12 +95,12 @@ class SummationBottomSheet extends ConsumerWidget {
             children: [
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: sessionState.totalNotes == 0 ? null : () {
+                  onPressed: sessionState.items.isEmpty ? null : () {
                     ref.read(sessionProvider.notifier).clearSession();
                     context.pop();
                   },
                   icon: const Icon(Icons.delete_outline),
-                  label: const Text('Clear'),
+                  label: const Text('Clear All'),
                   style: OutlinedButton.styleFrom(
                     foregroundColor: theme.colorScheme.error,
                     padding: const EdgeInsets.symmetric(vertical: 16),
@@ -110,7 +110,7 @@ class SummationBottomSheet extends ConsumerWidget {
               const SizedBox(width: 16),
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: sessionState.totalNotes == 0 ? null : () async {
+                  onPressed: sessionState.items.isEmpty ? null : () async {
                     await ref.read(sessionProvider.notifier).saveSessionToHistory();
                     if (context.mounted) {
                       context.pop();
